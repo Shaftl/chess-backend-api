@@ -25,7 +25,7 @@ const app = express();
 // Accept comma-separated origins (backwards compatible)
 const ALLOWED_ORIGINS = process.env.SOCKET_ORIGIN
   ? process.env.SOCKET_ORIGIN.split(",").map((s) => s.trim())
-  : ["http://localhost:3000"];
+  : ["https://chess-alyas.vercel.app"];
 
 // allow credentials so cookies can be used from frontend
 app.use(
