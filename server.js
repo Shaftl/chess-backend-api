@@ -1,4 +1,3 @@
-// server.js
 require("dotenv").config();
 
 const http = require("http");
@@ -7,12 +6,17 @@ const app = require("./app");
 const { initSockets } = require("./socket");
 
 const PORT = process.env.PORT || 4000;
-const SOCKET_ORIGIN =
-  process.env.SOCKET_ORIGIN || "https://chess-alyas.vercel.app";
+
+// Accept comma-separated origins (backwards compatible with single value)
+const SOCKET_ORIGIN = process.env.SOCKET_ORIGIN
+  ? process.env.SOCKET_ORIGIN.split(",").map((s) => s.trim())
+  : ["https://chess-alyas.vercel.app"];
+
 const server = http.createServer(app);
 
 function startServer() {
   try {
+    // pass array (or single string) to initSockets; socket server should accept it
     initSockets(server, SOCKET_ORIGIN);
     server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
   } catch (err) {

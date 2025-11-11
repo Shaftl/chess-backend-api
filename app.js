@@ -22,13 +22,21 @@ const {
 
 const app = express();
 
-const CLIENT_ORIGIN =
-  process.env.SOCKET_ORIGIN || "https://chess-alyas.vercel.app";
+// Accept comma-separated origins (backwards compatible)
+const ALLOWED_ORIGINS = process.env.SOCKET_ORIGIN
+  ? process.env.SOCKET_ORIGIN.split(",").map((s) => s.trim())
+  : ["https://chess-alyas.vercel.app"];
 
 // allow credentials so cookies can be used from frontend
 app.use(
   cors({
-    origin: CLIENT_ORIGIN,
+    origin: function (origin, callback) {
+      // allow requests with no origin (e.g. mobile apps, curl, or same-origin requests)
+      if (!origin) return callback(null, true);
+      if (ALLOWED_ORIGINS.indexOf(origin) !== -1) return callback(null, true);
+      // otherwise block
+      callback(new Error("Not allowed by CORS"));
+    },
     credentials: true,
   })
 );
