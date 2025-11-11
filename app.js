@@ -22,7 +22,8 @@ const {
 
 const app = express();
 
-const CLIENT_ORIGIN = process.env.SOCKET_ORIGIN || "http://localhost:3000";
+const CLIENT_ORIGIN =
+  process.env.SOCKET_ORIGIN || "https://chess-alyas.vercel.app";
 
 // allow credentials so cookies can be used from frontend
 app.use(

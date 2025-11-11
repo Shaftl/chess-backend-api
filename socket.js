@@ -549,7 +549,7 @@ async function attemptMatchmaking() {
 
 let ioServer = null;
 
-function initSockets(server, CLIENT_ORIGIN = "http://localhost:3000") {
+function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
   const io = new Server(server, {
     cors: { origin: CLIENT_ORIGIN, credentials: true },
   });

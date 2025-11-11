@@ -7,7 +7,8 @@ const app = require("./app");
 const { initSockets } = require("./socket");
 
 const PORT = process.env.PORT || 4000;
-const SOCKET_ORIGIN = process.env.SOCKET_ORIGIN || "http://localhost:3000";
+const SOCKET_ORIGIN =
+  process.env.SOCKET_ORIGIN || "https://chess-alyas.vercel.app";
 const server = http.createServer(app);
 
 function startServer() {
