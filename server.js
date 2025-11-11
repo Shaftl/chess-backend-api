@@ -1,3 +1,4 @@
+// server.js (or the file that starts the server)
 require("dotenv").config();
 
 const http = require("http");
@@ -8,9 +9,12 @@ const { initSockets } = require("./socket");
 const PORT = process.env.PORT || 4000;
 
 // Accept comma-separated origins (backwards compatible with single value)
+// normalize and filter empties
 const SOCKET_ORIGIN = process.env.SOCKET_ORIGIN
-  ? process.env.SOCKET_ORIGIN.split(",").map((s) => s.trim())
-  : ["https://chess-alyas.vercel.app"];
+  ? process.env.SOCKET_ORIGIN.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  : ["https://chess-alyas.vercel.app", "http://localhost:3000"];
 
 const server = http.createServer(app);
 

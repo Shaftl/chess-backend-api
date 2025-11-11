@@ -1,3 +1,4 @@
+// app.js
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
@@ -22,10 +23,31 @@ const {
 
 const app = express();
 
-// Accept comma-separated origins (backwards compatible)
-const ALLOWED_ORIGINS = process.env.SOCKET_ORIGIN
-  ? process.env.SOCKET_ORIGIN.split(",").map((s) => s.trim())
-  : ["https://chess-alyas.vercel.app"];
+// --- START: improved origins parsing (supports comma-separated values, filters empties) ---
+function parseOrigins(envVal) {
+  if (!envVal) return [];
+  return envVal
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// Backwards-compatible default (your production origin)
+const DEFAULT_ORIGINS = ["https://chess-alyas.vercel.app"];
+
+// Always include localhost during development (convenience)
+const DEV_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"];
+
+// Build allowed origins from env + sensible defaults, removing duplicates and empties
+const fromEnv = parseOrigins(process.env.SOCKET_ORIGIN);
+const ALLOWED_ORIGINS = Array.from(
+  new Set([
+    ...fromEnv,
+    ...DEFAULT_ORIGINS,
+    ...(process.env.NODE_ENV === "production" ? [] : DEV_ORIGINS),
+  ])
+).filter(Boolean);
+// --- END: improved origins parsing ---
 
 // allow credentials so cookies can be used from frontend
 app.use(
