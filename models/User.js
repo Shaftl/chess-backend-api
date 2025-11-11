@@ -1,4 +1,3 @@
-// backend/models/User.js
 const mongoose = require("mongoose");
 
 const FriendSchema = new mongoose.Schema({
@@ -8,11 +7,15 @@ const FriendSchema = new mongoose.Schema({
 });
 
 const FriendRequestSchema = new mongoose.Schema({
-  reqId: { type: String, required: true, unique: true },
+  reqId: {
+    type: String,
+    required: true,
+    default: () => new mongoose.Types.ObjectId().toString(),
+  },
   fromUserId: { type: String, required: true },
   fromUsername: { type: String },
   ts: { type: Number, default: () => Date.now() },
-  status: { type: String, default: "pending" }, // 'pending', 'accepted', 'declined'
+  status: { type: String, default: "pending" },
 });
 
 const UserSchema = new mongoose.Schema({
@@ -20,21 +23,29 @@ const UserSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   passwordHash: { type: String, required: true },
 
-  // profile fields
   displayName: { type: String },
   avatarUrl: { type: String },
+
   bio: { type: String },
   country: { type: String },
   cups: { type: Number, default: 0 },
 
-  // friendship
+  dob: { type: Date, default: null },
+
   friends: { type: [FriendSchema], default: [] },
   incomingFriendRequests: { type: [FriendRequestSchema], default: [] },
 
-  // persist last known IP (set on register)
   lastIp: { type: String, default: null },
 
   createdAt: { type: Date, default: Date.now },
+});
+
+UserSchema.pre("save", function (next) {
+  if (this.dob && this.dob instanceof Date) {
+    const now = new Date();
+    if (this.dob > now) this.dob = null;
+  }
+  next();
 });
 
 module.exports = mongoose.model("User", UserSchema);

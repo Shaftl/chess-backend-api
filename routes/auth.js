@@ -1,10 +1,9 @@
-// backend/routes/auth.js
 const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const router = express.Router();
-const fetchLib = global.fetch ? global.fetch : require("node-fetch"); // fallback
+const fetchLib = global.fetch ? global.fetch : require("node-fetch");
 
 const {
   fetchGeoForIp,
@@ -66,6 +65,26 @@ function detectClientIp(req) {
   return "";
 }
 
+function getTokenFromReq(req) {
+  const authHeader =
+    req.headers["authorization"] || req.headers["Authorization"];
+  if (authHeader) {
+    const parts = authHeader.split(" ");
+    if (parts.length === 2) return parts[1];
+  }
+  const cookieHeader = req.headers && req.headers.cookie;
+  if (cookieHeader) {
+    const parts = cookieHeader.split(";");
+    for (const p of parts) {
+      const kv = p.split("=").map((s) => s.trim());
+      if (kv[0] === "token") {
+        return decodeURIComponent(kv[1] || "");
+      }
+    }
+  }
+  return null;
+}
+
 async function updateUserIpIfChanged(req, userId) {
   try {
     const clientIpDetected = detectClientIp(req);
@@ -89,9 +108,17 @@ async function updateUserIpIfChanged(req, userId) {
 /* register */
 router.post("/register", async (req, res) => {
   try {
-    const { username, email, password, clientIp } = req.body;
+    const { username, email, password, clientIp, dob } = req.body;
     if (!username || !email || !password)
       return res.status(400).json({ error: "Missing fields" });
+
+    let parsedDob = null;
+    if (dob) {
+      const d = new Date(dob);
+      if (!isNaN(d.getTime())) {
+        if (d <= new Date()) parsedDob = d;
+      }
+    }
 
     const existing = await User.findOne({ $or: [{ email }, { username }] });
     if (existing) return res.status(400).json({ error: "User exists" });
@@ -102,6 +129,7 @@ router.post("/register", async (req, res) => {
       email,
       passwordHash: hash,
       displayName: username,
+      dob: parsedDob,
     });
 
     const supplied = typeof clientIp === "string" ? normalizeIp(clientIp) : "";
@@ -120,6 +148,14 @@ router.post("/register", async (req, res) => {
     await user.save();
     const token = makeToken(user);
 
+    const cookieOptions = {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    };
+    res.cookie("token", token, cookieOptions);
+
     res.json({
       token,
       user: {
@@ -133,6 +169,7 @@ router.post("/register", async (req, res) => {
         country: user.country,
         cups: user.cups,
         lastIp: user.lastIp || null,
+        dob: user.dob ? user.dob.toISOString() : null,
       },
       country: geo.country,
       flagUrl: geo.flagUrl,
@@ -158,6 +195,15 @@ router.post("/login", async (req, res) => {
     if (!ok) return res.status(400).json({ error: "Invalid credentials" });
 
     const token = makeToken(user);
+
+    const cookieOptions = {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    };
+    res.cookie("token", token, cookieOptions);
+
     res.json({
       token,
       user: {
@@ -171,6 +217,7 @@ router.post("/login", async (req, res) => {
         country: user.country,
         cups: user.cups,
         lastIp: user.lastIp || null,
+        dob: user.dob ? user.dob.toISOString() : null,
       },
     });
   } catch (err) {
@@ -179,14 +226,24 @@ router.post("/login", async (req, res) => {
   }
 });
 
-/* auth middleware that updates IP on each request */
+/* logout */
+router.post("/logout", (req, res) => {
+  try {
+    res.clearCookie("token", {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("logout error", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 async function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Missing auth" });
-  const parts = authHeader.split(" ");
-  if (parts.length !== 2)
-    return res.status(401).json({ error: "Invalid auth header" });
-  const token = parts[1];
+  const token = getTokenFromReq(req);
+  if (!token) return res.status(401).json({ error: "Missing auth" });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
@@ -222,6 +279,7 @@ router.get("/me", authMiddleware, async (req, res) => {
       cups: u.cups,
       lastIp: u.lastIp || null,
       flagUrl,
+      dob: u.dob ? u.dob.toISOString() : null,
     });
   } catch (err) {
     console.error("/me error", err);
@@ -231,7 +289,7 @@ router.get("/me", authMiddleware, async (req, res) => {
 
 router.put("/profile", authMiddleware, async (req, res) => {
   try {
-    const { displayName, bio, cups, country, avatarUrl } = req.body;
+    const { displayName, bio, cups, country, avatarUrl, dob } = req.body;
     const u = await User.findById(req.user.id);
     if (!u) return res.status(404).json({ error: "Not found" });
 
@@ -240,6 +298,13 @@ router.put("/profile", authMiddleware, async (req, res) => {
     if (typeof cups === "number") u.cups = cups;
     if (typeof country === "string") u.country = country.toUpperCase();
     if (typeof avatarUrl === "string") u.avatarUrl = avatarUrl;
+
+    if (dob) {
+      const d = new Date(dob);
+      if (!isNaN(d.getTime()) && d <= new Date()) {
+        u.dob = d;
+      }
+    }
 
     await u.save();
     res.json({
@@ -252,6 +317,7 @@ router.put("/profile", authMiddleware, async (req, res) => {
       country: u.country,
       cups: u.cups,
       lastIp: u.lastIp || null,
+      dob: u.dob ? u.dob.toISOString() : null,
     });
   } catch (err) {
     console.error("/profile PUT error", err);
@@ -259,7 +325,6 @@ router.put("/profile", authMiddleware, async (req, res) => {
   }
 });
 
-/* location endpoint */
 router.get("/location", async (req, res) => {
   try {
     const ip = (
