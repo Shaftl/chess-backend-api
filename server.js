@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 4000;
 // Accept comma-separated origins (backwards compatible with single value)
 const SOCKET_ORIGIN = process.env.SOCKET_ORIGIN
   ? process.env.SOCKET_ORIGIN.split(",").map((s) => s.trim())
-  : ["https://chess-alyas.vercel.app"];
+  : ["http://localhost:3000"];
 
 const server = http.createServer(app);
 
