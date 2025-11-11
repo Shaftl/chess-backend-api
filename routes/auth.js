@@ -11,6 +11,57 @@ const {
   isLoopbackOrLocal,
 } = require("../helpers/geo");
 
+/**
+ * Cookie helper for consistent cross-site behavior
+ * - When running under HTTPS / production we set SameSite=None and Secure=true so browsers accept cross-site cookies.
+ * - For local dev (http) we keep SameSite=lax and secure=false so cookies work on localhost.
+ */
+function makeCookieOptions(req) {
+  const forwardedProto = (req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim();
+  const isSecure =
+    req.secure ||
+    forwardedProto === "https" ||
+    process.env.NODE_ENV === "production";
+
+  return {
+    httpOnly: true,
+    sameSite: isSecure ? "none" : "lax",
+    secure: !!isSecure,
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    path: "/",
+    // domain: process.env.COOKIE_DOMAIN || undefined, // uncomment if you need a specific domain
+  };
+}
+
+/**
+ * tryRequire(pathsArray)
+ * Try multiple require() paths and return the first successful module.
+ * If none found, rethrow the MODULE_NOT_FOUND error (or throw a clear error).
+ *
+ * NOTE: In this file we already require ../models/User above, so tryRequire usage from
+ * the prior version is not strictly needed here. Kept helper out of other modules.
+ */
+function tryRequire(paths) {
+  let lastErr = null;
+  for (const p of paths) {
+    try {
+      return require(p);
+    } catch (err) {
+      if (err && err.code && err.code === "MODULE_NOT_FOUND") {
+        lastErr = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  const msg = `tryRequire: none of the paths resolved: ${paths.join(", ")}`;
+  const e = new Error(msg);
+  e.code = "MODULE_NOT_FOUND";
+  throw e;
+}
+
 function makeToken(user) {
   return jwt.sign(
     { id: user._id, username: user.username },
@@ -148,12 +199,7 @@ router.post("/register", async (req, res) => {
     await user.save();
     const token = makeToken(user);
 
-    const cookieOptions = {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    };
+    const cookieOptions = makeCookieOptions(req);
     res.cookie("token", token, cookieOptions);
 
     res.json({
@@ -196,12 +242,7 @@ router.post("/login", async (req, res) => {
 
     const token = makeToken(user);
 
-    const cookieOptions = {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    };
+    const cookieOptions = makeCookieOptions(req);
     res.cookie("token", token, cookieOptions);
 
     res.json({
@@ -229,11 +270,7 @@ router.post("/login", async (req, res) => {
 /* logout */
 router.post("/logout", (req, res) => {
   try {
-    res.clearCookie("token", {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-    });
+    res.clearCookie("token", makeCookieOptions(req));
     res.json({ ok: true });
   } catch (err) {
     console.error("logout error", err);

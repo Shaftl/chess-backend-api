@@ -31,6 +31,16 @@ app.use(
     credentials: true,
   })
 );
+
+// Ensure Access-Control-Allow-Credentials header (helps some proxies/browsers)
+// Note: this is additive; cors({ credentials: true }) already sets this for normal responses.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  // help caching proxies vary by origin
+  res.setHeader("Vary", "Origin");
+  next();
+});
+
 app.use(express.json());
 
 // IMPORTANT: trust proxy so req.ip/x-forwarded-for work when behind a proxy/load-balancer
