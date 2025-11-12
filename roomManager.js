@@ -1,4 +1,5 @@
-// roomManager.js
+// roomManager.js (final fixed version)
+
 const { Chess } = require("chess.js");
 const Game = require("./models/Game");
 const User = require("./models/User");
@@ -439,9 +440,80 @@ function notifyUser(userId, event, payload) {
   }
 }
 
+/* ------------------------------
+   Room expiry timers management
+   ------------------------------ */
+const expiryTimers = {}; // roomId -> timeout handle
+
+function clearRoomExpiryTimer(roomId) {
+  try {
+    if (!roomId) return;
+    const t = expiryTimers[roomId];
+    if (t) {
+      clearTimeout(t);
+      delete expiryTimers[roomId];
+    }
+  } catch (e) {
+    // non-fatal
+  }
+}
+
+function scheduleRoomExpiry(roomId, ms) {
+  try {
+    if (!roomId || !rooms[roomId]) return;
+    clearRoomExpiryTimer(roomId);
+    const timeout = setTimeout(async () => {
+      try {
+        const room = rooms[roomId];
+        if (!room) return;
+        // If game already started (two colored players) or already finished, skip expiry
+        const coloredPlayers = (room.players || []).filter(
+          (p) => p.color === "w" || p.color === "b"
+        );
+        if (room.finished || coloredPlayers.length >= 2) {
+          clearRoomExpiryTimer(roomId);
+          return;
+        }
+
+        // mark finished (expired) so saveFinishedGame clears db activeRoom/status for participants
+        room.paused = true;
+        room.finished = {
+          reason: "room-expired",
+          result: "none",
+          message: "Room expired — no opponent joined",
+          finishedAt: Date.now(),
+        };
+
+        broadcastRoomState(roomId);
+        await saveFinishedGame(roomId);
+
+        // keep room in memory (for viewing history) — do not forcibly delete unless you want
+        clearRoomExpiryTimer(roomId);
+      } catch (err) {
+        console.error("room expiry handler error", err);
+        clearRoomExpiryTimer(roomId);
+      }
+    }, Math.max(1000, Number(ms) || DEFAULT_MS));
+    expiryTimers[roomId] = timeout;
+  } catch (e) {}
+}
+
+/* broadcastRoomState — emits current room state and persists to db
+   Also: cancels room expiry when two players present or when finished.
+*/
 function broadcastRoomState(roomId) {
   const room = rooms[roomId];
   if (!room || !io) return;
+
+  // if two colored players are present OR room finished -> cancel expiry
+  try {
+    const coloredPlayers = (room.players || []).filter(
+      (p) => p.color === "w" || p.color === "b"
+    );
+    if (room.finished || coloredPlayers.length >= 2) {
+      clearRoomExpiryTimer(roomId);
+    }
+  } catch (e) {}
 
   let pending = null;
   if (room.pendingDrawOffer) {
@@ -545,7 +617,7 @@ function broadcastRoomState(roomId) {
 /**
  * createRoom(options)
  * Creates a new in-memory room (and persists initial snapshot via broadcastRoomState).
- * Enforces single active room per user via DB updates.
+ * ENHANCEMENT: only reserve DB activeRoom when BOTH participants exist (matchmaking/challenge flows).
  */
 async function createRoom(options = {}) {
   try {
@@ -580,6 +652,8 @@ async function createRoom(options = {}) {
     } catch (e) {}
 
     // ENFORCE single active room per user (server-side) using conditional update
+    // IMPORTANT BEHAVIOR CHANGE: DO NOT reserve activeRoom for a single-user create.
+    // Only attempt to set activeRoom if we have BOTH participants (initiatorUser && acceptorUser).
     const setIfFree = async (userObj, rid) => {
       if (!userObj || !userObj.id) return { ok: true, set: false };
       const uid = String(userObj.id);
@@ -597,64 +671,66 @@ async function createRoom(options = {}) {
       }
     };
 
-    // we will attempt to reserve activeRoom for userA and userB (if they exist)
     const reserveId = roomId;
     let reservedA = { ok: true, set: false };
     let reservedB = { ok: true, set: false };
 
-    if (initiatorUser && initiatorUser._id) {
-      reservedA = await setIfFree(initiatorUser, reserveId);
-      if (!reservedA.ok) {
-        // DB error -> abort
-        return null;
+    // Only attempt reservation when both users are provided (matchmaking / challenge flows).
+    if (initiatorUser && acceptorUser) {
+      if (initiatorUser && initiatorUser._id) {
+        reservedA = await setIfFree(initiatorUser, reserveId);
+        if (!reservedA.ok) {
+          // DB error -> abort
+          return null;
+        }
+        if (!reservedA.set) {
+          // already has activeRoom -> abort
+          try {
+            if (io && userA && userA.id) {
+              io.to(userA.id).emit("create-room-failed", {
+                error: "already-in-active-room",
+                activeRoom: initiatorUser.activeRoom,
+              });
+            }
+          } catch (e) {}
+          return null;
+        }
       }
-      if (!reservedA.set) {
-        // already has activeRoom -> abort
-        try {
-          if (io && userA && userA.id) {
-            io.to(userA.id).emit("create-room-failed", {
-              error: "already-in-active-room",
-              activeRoom: initiatorUser.activeRoom,
-            });
-          }
-        } catch (e) {}
-        return null;
-      }
-    }
 
-    if (acceptorUser && acceptorUser._id) {
-      reservedB = await setIfFree(acceptorUser, reserveId);
-      if (!reservedB.ok) {
-        // DB error - rollback A if reserved
-        if (reservedA.set && initiatorUser && initiatorUser._id) {
-          try {
-            await User.findByIdAndUpdate(initiatorUser._id, {
-              activeRoom: null,
-              status: "idle",
-            }).exec();
-          } catch (e) {}
-        }
-        return null;
-      }
-      if (!reservedB.set) {
-        // acceptor already in active room - rollback A
-        if (reservedA.set && initiatorUser && initiatorUser._id) {
-          try {
-            await User.findByIdAndUpdate(initiatorUser._id, {
-              activeRoom: null,
-              status: "idle",
-            }).exec();
-          } catch (e) {}
-        }
-        try {
-          if (io && userB && userB.id) {
-            io.to(userB.id).emit("create-room-failed", {
-              error: "already-in-active-room",
-              activeRoom: acceptorUser.activeRoom,
-            });
+      if (acceptorUser && acceptorUser._id) {
+        reservedB = await setIfFree(acceptorUser, reserveId);
+        if (!reservedB.ok) {
+          // DB error - rollback A if reserved
+          if (reservedA.set && initiatorUser && initiatorUser._id) {
+            try {
+              await User.findByIdAndUpdate(initiatorUser._id, {
+                activeRoom: null,
+                status: "idle",
+              }).exec();
+            } catch (e) {}
           }
-        } catch (e) {}
-        return null;
+          return null;
+        }
+        if (!reservedB.set) {
+          // acceptor already in active room - rollback A
+          if (reservedA.set && initiatorUser && initiatorUser._id) {
+            try {
+              await User.findByIdAndUpdate(initiatorUser._id, {
+                activeRoom: null,
+                status: "idle",
+              }).exec();
+            } catch (e) {}
+          }
+          try {
+            if (io && userB && userB.id) {
+              io.to(userB.id).emit("create-room-failed", {
+                error: "already-in-active-room",
+                activeRoom: acceptorUser.activeRoom,
+              });
+            }
+          } catch (e) {}
+          return null;
+        }
       }
     }
 
@@ -771,6 +847,22 @@ async function createRoom(options = {}) {
 
     broadcastRoomState(roomId);
     scheduleFirstMoveTimer(roomId);
+
+    // If this room currently only has <2 colored players (rare for createRoom when both provided),
+    // schedule expiry so single-player rooms don't block users indefinitely.
+    try {
+      const coloredPlayersNow = (room.players || []).filter(
+        (p) => p.color === "w" || p.color === "b"
+      );
+      if (coloredPlayersNow.length < 2) {
+        // schedule expiry for creator-only rooms using settings.minutesMs
+        scheduleRoomExpiry(roomId, room.settings?.minutesMs || minutesMs);
+      } else {
+        // if both players present, ensure no expiry is scheduled
+        clearRoomExpiryTimer(roomId);
+      }
+    } catch (e) {}
+
     return { roomId };
   } catch (err) {
     console.error("createRoom error:", err);
@@ -1035,4 +1127,6 @@ module.exports = {
   enqueueMatch,
   dequeueBySocketId,
   getQueueSizes,
+  // internals for debugging
+  _internal: { expiryTimers },
 };

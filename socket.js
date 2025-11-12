@@ -25,6 +25,7 @@ const {
   onlineUsers,
   generateRoomCode,
   assignColorsForRematch,
+  createRematchRoom, // new helper added in roomManager
 } = roomManager;
 
 const User = require("./models/User");
@@ -904,7 +905,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
 
     socket.on(
       "create-room",
-      ({ roomId: requestedRoomId, minutes, colorPreference, user }) => {
+      async ({ roomId: requestedRoomId, minutes, colorPreference, user }) => {
         try {
           let minutesNum =
             typeof minutes === "number"
@@ -944,134 +945,98 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
             }
           }
 
-          // Before assigning playing seat, if this user is authenticated attempt to reserve db activeRoom
-          (async () => {
-            try {
-              if (socket.user && socket.user.id) {
-                const r = await tryReserveActiveRoom(socket.user.id, roomId);
-                if (!r.ok) {
-                  socket.emit("room-created", {
-                    ok: false,
-                    error: "server-error",
-                  });
-                  return;
-                }
-                if (!r.set) {
-                  socket.emit("room-created", {
-                    ok: false,
-                    error: "already-in-active-room",
-                    activeRoom: (
-                      await User.findById(socket.user.id).lean().exec()
-                    ).activeRoom,
-                  });
-                  return;
-                }
-              }
+          // create in-memory room (no pre-reservation for single-player create)
+          rooms[roomId] = {
+            players: [],
+            moves: [],
+            chess: new Chess(),
+            fen: null,
+            lastIndex: -1,
+            clocks: null,
+            paused: false,
+            disconnectTimers: {},
+            firstMoveTimer: null,
+            pendingDrawOffer: null,
+            finished: null,
+            settings: {
+              minutes: minutesNum,
+              minutesMs,
+              creatorId: socket.user?.id || socket.id,
+              colorPreference: colorPreference || "random",
+            },
+            messages: [],
+            rematch: null,
+          };
 
-              rooms[roomId] = {
-                players: [],
-                moves: [],
-                chess: new Chess(),
-                fen: null,
-                lastIndex: -1,
-                clocks: null,
-                paused: false,
-                disconnectTimers: {},
-                firstMoveTimer: null,
-                pendingDrawOffer: null,
-                finished: null,
-                settings: {
-                  minutes: minutesNum,
-                  minutesMs,
-                  creatorId: socket.user?.id || socket.id,
-                  colorPreference: colorPreference || "random",
-                },
-                messages: [],
-                rematch: null,
-              };
+          const room = rooms[roomId];
 
-              const room = rooms[roomId];
+          let assignedColor = "spectator";
+          if (socket.user) {
+            const playerObj = {
+              id: socket.id,
+              user: socket.user || user || { username: "guest" },
+              color: "spectator",
+              online: true,
+              disconnectedAt: null,
+            };
 
-              let assignedColor = "spectator";
-              if (socket.user) {
-                const playerObj = {
-                  id: socket.id,
-                  user: socket.user || user || { username: "guest" },
-                  color: "spectator",
-                  online: true,
-                  disconnectedAt: null,
-                };
+            playerObj.user = ensureAvatarAbs(playerObj.user);
 
-                playerObj.user = ensureAvatarAbs(playerObj.user);
+            const pref = room.settings.colorPreference;
+            const wTaken = room.players.some((p) => p.color === "w");
+            const bTaken = room.players.some((p) => p.color === "b");
 
-                const pref = room.settings.colorPreference;
-                const wTaken = room.players.some((p) => p.color === "w");
-                const bTaken = room.players.some((p) => p.color === "b");
-
-                if (pref === "white" && !wTaken) assignedColor = "w";
-                else if (pref === "black" && !bTaken) assignedColor = "b";
-                else {
-                  if (!wTaken) assignedColor = "w";
-                  else if (!bTaken) assignedColor = "b";
-                  else assignedColor = "spectator";
-                }
-
-                playerObj.color = assignedColor;
-                room.players.push(playerObj);
-                socket.emit("player-assigned", { color: playerObj.color });
-
-                // mark DB user activeRoom if they are a colored (playing) seat
-                if (
-                  playerObj.user &&
-                  (playerObj.color === "w" || playerObj.color === "b")
-                ) {
-                  try {
-                    await markUserActiveRoom(
-                      playerObj.user.id || playerObj.user._id,
-                      roomId
-                    );
-                  } catch (e) {
-                    console.error(
-                      "markUserActiveRoom after create-room failed",
-                      e
-                    );
-                  }
-                }
-              } else {
-                const playerObj = {
-                  id: socket.id,
-                  user: user || { username: "guest" },
-                  color: "spectator",
-                  online: true,
-                  disconnectedAt: null,
-                };
-                playerObj.user = ensureAvatarAbs(playerObj.user);
-
-                room.players.push(playerObj);
-                assignedColor = "spectator";
-                socket.emit("player-assigned", { color: "spectator" });
-              }
-
-              broadcastRoomState(roomId);
-
-              socket.join(roomId);
-              socket.emit("room-created", {
-                ok: true,
-                roomId,
-                settings: room.settings,
-                assignedColor,
-              });
-              console.log(
-                "Room created:",
-                roomId,
-                "by",
-                socket.user?.username || socket.id
-              );
-            } catch (err) {
-              console.error("create-room error", err);
-              socket.emit("room-created", { ok: false, error: "Server error" });
+            if (pref === "white" && !wTaken) assignedColor = "w";
+            else if (pref === "black" && !bTaken) assignedColor = "b";
+            else {
+              if (!wTaken) assignedColor = "w";
+              else if (!bTaken) assignedColor = "b";
+              else assignedColor = "spectator";
             }
-          })();
+
+            playerObj.color = assignedColor;
+            room.players.push(playerObj);
+            socket.emit("player-assigned", { color: playerObj.color });
+
+            // IMPORTANT: do NOT mark DB activeRoom here for single-player creation.
+            // We only mark activeRoom for a DB user when they actually become
+            // part of an active two-player match (handled on join / on second player).
+          } else {
+            const playerObj = {
+              id: socket.id,
+              user: user || { username: "guest" },
+              color: "spectator",
+              online: true,
+              disconnectedAt: null,
+            };
+            playerObj.user = ensureAvatarAbs(playerObj.user);
+
+            room.players.push(playerObj);
+            assignedColor = "spectator";
+            socket.emit("player-assigned", { color: "spectator" });
+          }
+
+          // broadcast and schedule expiry (roomManager.broadcastRoomState
+          // will automatically cancel expiry when second player joins)
+          broadcastRoomState(roomId);
+
+          // If there's only <2 colored players, schedule an expiry timer for this room
+          // (clears/finishes room after settings.minutesMs). This is done in roomManager.js
+          // via scheduleRoomExpiry called inside broadcastRoomState (if needed).
+
+          socket.join(roomId);
+          socket.emit("room-created", {
+            ok: true,
+            roomId,
+            settings: room.settings,
+            assignedColor,
+          });
+          console.log(
+            "Room created:",
+            roomId,
+            "by",
+            socket.user?.username || socket.id
+          );
         } catch (err) {
           console.error("create-room outer error", err);
           socket.emit("room-created", { ok: false, error: "Server error" });
@@ -1784,7 +1749,9 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           try {
             const payload = {
               id: orig._id?.toString(),
-              _id: orig._id?.toString(),
+              _id: orig._1d?.toString
+                ? orig._id?.toString()
+                : orig._id?.toString(),
               userId: orig.userId,
               type: orig.type,
               title: orig.title,
@@ -2094,7 +2061,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       io.to(roomId).emit("game-saved", { ok: true });
     });
 
-    // play-again / rematch (kept intact)
+    // play-again / rematch (modified here to use createRematchRoom)
     socket.on("play-again", async ({ roomId }) => {
       try {
         if (!roomId) return;
@@ -2219,67 +2186,189 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           required.every((id) => acceptedKeys.includes(id));
 
         if (allAccepted) {
-          assignColorsForRematch(room);
-
-          room.chess = new Chess();
-          room.fen = room.chess.fen();
-          room.moves = [];
-          room.lastIndex = -1;
-          room.finished = null;
-          room.pendingDrawOffer = null;
-          room.paused = false;
-
-          if (room.settings && room.settings.minutesMs) {
-            const ms = room.settings.minutesMs;
-            room.clocks = {
-              w: ms,
-              b: ms,
-              running: room.chess.turn(),
-              lastTick: Date.now(),
-            };
-          } else {
-            room.clocks = room.clocks
-              ? {
-                  w: DEFAULT_MS,
-                  b: DEFAULT_MS,
-                  running: room.chess.turn(),
-                  lastTick: Date.now(),
-                }
-              : null;
-          }
-
-          room.rematch = null;
-
-          broadcastRoomState(roomId);
-
-          io.to(roomId).emit("play-again", {
-            ok: true,
-            started: true,
-            message: "Rematch started",
-          });
-
-          for (const p of room.players) {
-            io.to(p.id).emit("player-assigned", { color: p.color });
-          }
-
-          // Persist rematch-started notifications to participants
+          // Attempt to create a brand-new room for the rematch (prevents re-using the old roomId)
           try {
-            for (const p of room.players) {
-              const uid = p.user?.id || p.id;
-              if (!uid) continue;
-              await notificationService.createNotification(
-                String(uid),
-                "rematch_started",
-                "Rematch started",
-                `Rematch started in room ${roomId}`,
-                { roomId }
-              );
+            const res = await createRematchRoom(roomId);
+            if (res && res.ok && res.roomId) {
+              const newRoomId = res.roomId;
+              const newRoom = rooms[newRoomId];
+
+              // join players' sockets to new room and emit player-assigned for each
+              for (const p of newRoom.players) {
+                try {
+                  const sock = io && io.sockets && io.sockets.sockets.get(p.id);
+                  if (sock) {
+                    // leave old room (best-effort)
+                    try {
+                      sock.leave(roomId);
+                    } catch (e) {}
+                    sock.join(newRoomId);
+                    io.to(p.id).emit("player-assigned", { color: p.color });
+                    // If p has an associated user id (DB user), mark their activeRoom
+                    try {
+                      const uid = p.user?.id || p.user?._id || null;
+                      if (uid && (p.color === "w" || p.color === "b")) {
+                        await markUserActiveRoom(uid, newRoomId);
+                      }
+                    } catch (e) {
+                      console.error(
+                        "markUserActiveRoom during rematch failed",
+                        e
+                      );
+                    }
+                  }
+                } catch (e) {}
+              }
+
+              broadcastRoomState(newRoomId);
+
+              io.to(newRoomId).emit("play-again", {
+                ok: true,
+                started: true,
+                message: "Rematch started",
+                roomId: newRoomId,
+              });
+
+              // Persist rematch-started notifications to participants
+              try {
+                for (const p of newRoom.players) {
+                  const uid = p.user?.id || p.id;
+                  if (!uid) continue;
+                  await notificationService.createNotification(
+                    String(uid),
+                    "rematch_started",
+                    "Rematch started",
+                    `Rematch started in room ${newRoomId}`,
+                    { roomId: newRoomId }
+                  );
+                }
+              } catch (e) {
+                console.error("createNotification (rematch_started) failed", e);
+              }
+
+              scheduleFirstMoveTimer(newRoomId);
+
+              // Mark original rematch notification as read for the acceptor
+              try {
+                const orig = await Notification.findOneAndUpdate(
+                  { "data.roomId": roomId, userId: String(socket.user?.id) },
+                  {
+                    $set: {
+                      read: true,
+                      updatedAt: Date.now(),
+                      "data.status": "accepted",
+                    },
+                  },
+                  { new: true }
+                )
+                  .lean()
+                  .exec();
+                if (orig) {
+                  try {
+                    const payload = {
+                      id: orig._id?.toString(),
+                      _id: orig._id?.toString(),
+                      userId: orig.userId,
+                      type: orig.type,
+                      title: orig.title,
+                      body: orig.body,
+                      data: orig.data,
+                      read: orig.read,
+                      createdAt: orig.createdAt,
+                      updatedAt: orig.updatedAt,
+                    };
+                    io.to(`user:${String(socket.user?.id)}`).emit(
+                      "notification",
+                      payload
+                    );
+                  } catch (e) {}
+                }
+              } catch (e) {
+                console.error(
+                  "accept-play-again: mark original rematch notification failed",
+                  e
+                );
+              }
+
+              return;
             }
           } catch (e) {
-            console.error("createNotification (rematch_started) failed", e);
+            console.error("createRematchRoom failed or errored", e);
+            // fallback to original in-place rematch below
           }
 
-          scheduleFirstMoveTimer(roomId);
+          // fallback — original behavior (reset same room) if new-room creation failed
+          try {
+            assignColorsForRematch(room);
+
+            room.chess = new Chess();
+            room.fen = room.chess.fen();
+            room.moves = [];
+            room.lastIndex = -1;
+            room.finished = null;
+            room.pendingDrawOffer = null;
+            room.paused = false;
+
+            if (room.settings && room.settings.minutesMs) {
+              const ms = room.settings.minutesMs;
+              room.clocks = {
+                w: ms,
+                b: ms,
+                running: room.chess.turn(),
+                lastTick: Date.now(),
+              };
+            } else {
+              room.clocks = room.clocks
+                ? {
+                    w: DEFAULT_MS,
+                    b: DEFAULT_MS,
+                    running: room.chess.turn(),
+                    lastTick: Date.now(),
+                  }
+                : null;
+            }
+
+            room.rematch = null;
+
+            broadcastRoomState(roomId);
+
+            io.to(roomId).emit("play-again", {
+              ok: true,
+              started: true,
+              message: "Rematch started",
+            });
+
+            for (const p of room.players) {
+              io.to(p.id).emit("player-assigned", { color: p.color });
+            }
+
+            // Persist rematch-started notifications to participants
+            try {
+              for (const p of room.players) {
+                const uid = p.user?.id || p.id;
+                if (!uid) continue;
+                await notificationService.createNotification(
+                  String(uid),
+                  "rematch_started",
+                  "Rematch started",
+                  `Rematch started in room ${roomId}`,
+                  { roomId }
+                );
+              }
+            } catch (e) {
+              console.error("createNotification (rematch_started) failed", e);
+            }
+
+            scheduleFirstMoveTimer(roomId);
+          } catch (err) {
+            console.error("fallback rematch reset failed", err);
+            socket.emit("play-again", {
+              ok: false,
+              started: false,
+              error: "Server error",
+            });
+            return;
+          }
         } else {
           broadcastRoomState(roomId);
         }
@@ -3270,28 +3359,6 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         return false;
       }
     }
-
-    socket.on("webrtc-offer", ({ roomId, toSocketId, offer }) => {
-      try {
-        const payload = { fromSocketId: socket.id, offer };
-
-        if (toSocketId) {
-          relayToSocketOrUser(toSocketId, "webrtc-offer", payload);
-          return;
-        }
-
-        if (roomId && rooms[roomId]) {
-          const opponent = (rooms[roomId].players || []).find(
-            (p) => p.id !== socket.id && (p.color === "w" || p.color === "b")
-          );
-          if (opponent && opponent.id) {
-            relayToSocketOrUser(opponent.id, "webrtc-offer", payload);
-          }
-        }
-      } catch (e) {
-        console.error("webrtc-offer relay error:", e);
-      }
-    });
 
     socket.on("webrtc-answer", ({ roomId, toSocketId, answer }) => {
       try {
