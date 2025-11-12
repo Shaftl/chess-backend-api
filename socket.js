@@ -1,9 +1,12 @@
 // backend/socket.js
+// Complete fixed version — copy & paste to replace your current socket.js
+
 const { Server } = require("socket.io");
 const jwt = require("jsonwebtoken");
 const { Chess } = require("chess.js");
 
 const roomManager = require("./roomManager");
+
 const {
   rooms,
   DEFAULT_MS,
@@ -31,6 +34,67 @@ const Room = require("./models/Room");
 // NEW: notification service + Notification model
 const notificationService = require("./services/notificationService");
 const Notification = require("./models/Notification");
+
+const mongoose = require("mongoose");
+
+/* ----------------- Helper functions ----------------- */
+
+/**
+ * markUserActiveRoom(userId, roomId)
+ * Marks the given user document with activeRoom and status 'playing'.
+ * Best-effort, logs errors but does not throw.
+ */
+async function markUserActiveRoom(userId, roomId) {
+  try {
+    if (!userId) return;
+    await User.findByIdAndUpdate(
+      String(userId),
+      { $set: { activeRoom: roomId, status: "playing" } },
+      { new: true, upsert: false }
+    ).exec();
+  } catch (err) {
+    console.error("markUserActiveRoom error", err);
+  }
+}
+
+/**
+ * clearActiveRoomForUsers([userIds])
+ * Clears activeRoom and sets status to 'idle' for provided user ids.
+ */
+async function clearActiveRoomForUsers(userIds = []) {
+  try {
+    const ids = (userIds || []).filter(Boolean).map(String);
+    if (!ids.length) return;
+    // ensure we construct ObjectId instances correctly (use new)
+    const objectIds = ids
+      .filter((id) => mongoose.Types.ObjectId.isValid(String(id)))
+      .map((id) => new mongoose.Types.ObjectId(String(id)));
+    if (objectIds.length === 0) return;
+    await User.updateMany(
+      { _id: { $in: objectIds } },
+      { $set: { activeRoom: null, status: "idle" } }
+    ).exec();
+  } catch (err) {
+    console.error("clearActiveRoomForUsers error", err);
+  }
+}
+
+/**
+ * clearActiveRoomForRoom(room)
+ * Convenience to clear activeRoom for both colored players inside a room.
+ */
+async function clearActiveRoomForRoom(room) {
+  try {
+    if (!room || !Array.isArray(room.players)) return;
+    const ids = room.players
+      .filter((p) => p.color === "w" || p.color === "b")
+      .map((p) => p?.user?.id || p?.user?._id)
+      .filter(Boolean);
+    if (ids.length) await clearActiveRoomForUsers(ids);
+  } catch (err) {
+    console.error("clearActiveRoomForRoom error", err);
+  }
+}
 
 /** Helper: verifyToken */
 function verifyToken(token) {
@@ -151,9 +215,60 @@ function normalizePromotionChar(p) {
   }
 }
 
+/* ---------------------------------------------------------------------
+   Reservation helpers (enforce single active room per user)
+   - tryReserveActiveRoom(userId, roomId) -> { ok, set, error }
+   - releaseActiveRoom(userId, roomId) -> { ok, released, error }
+   These use conditional updates so two concurrent requests won't both succeed.
+   --------------------------------------------------------------------- */
+
+async function tryReserveActiveRoom(userId, roomId) {
+  try {
+    if (!userId) return { ok: true, set: false };
+    const uid = String(userId);
+    // Attempt to set activeRoom only if currently null or empty string
+    const updated = await User.findOneAndUpdate(
+      { _id: uid, $or: [{ activeRoom: null }, { activeRoom: "" }] },
+      { $set: { activeRoom: roomId, status: "playing" } },
+      { new: true }
+    )
+      .lean()
+      .exec();
+    if (updated) return { ok: true, set: true };
+    return { ok: true, set: false };
+  } catch (e) {
+    return { ok: false, error: e };
+  }
+}
+
+async function releaseActiveRoom(userId, roomId) {
+  try {
+    if (!userId) return { ok: true, released: false };
+    const uid = String(userId);
+    // Only clear if activeRoom matches roomId (best-effort to avoid clobbering)
+    const query = roomId
+      ? { _id: uid, activeRoom: String(roomId) }
+      : { _id: uid };
+    const updated = await User.findOneAndUpdate(
+      query,
+      { $set: { activeRoom: null, status: "idle" } },
+      { new: true }
+    )
+      .lean()
+      .exec();
+    if (updated) return { ok: true, released: true };
+    // If no doc matched (maybe already cleared or different room), still ok
+    return { ok: true, released: false };
+  } catch (e) {
+    return { ok: false, error: e };
+  }
+}
+
 /* -------------------------------
-   Matchmaking / Play Online Queue
+   Matchmaking / Play Queue helpers
+   (kept from your code)
    ------------------------------- */
+
 const playQueue = new Map(); // key => entry { id, socketId, cups, ts, minutes, colorPreference }
 const playQueueByCups = new Map(); // cups -> Set of keys
 
@@ -224,6 +339,11 @@ function findSocketsForKeys(keys) {
   } catch (e) {}
   return out;
 }
+
+/* -----------------------
+   Matchmaking algorithm
+   (adapted from your code; includes reservation attempt on fallback creation)
+   ----------------------- */
 
 async function attemptMatchmaking() {
   if (!playQueue.size) return;
@@ -348,10 +468,62 @@ async function attemptMatchmaking() {
         createdRoomId = null;
       }
 
+      // If createRoom failed (likely because one user busy), fallback to creating room here,
+      // but attempt to reserve both DB users first to avoid races.
       if (!createdRoomId) {
         try {
           let fallbackRoomId = generateRoomCode(8);
           while (rooms[fallbackRoomId]) fallbackRoomId = generateRoomCode(8);
+
+          // Attempt to reserve both users before building room
+          let reservedA = { ok: true, set: false };
+          let reservedB = { ok: true, set: false };
+          const userAId = e1.id ? String(e1.id) : null;
+          const userBId = e2.id ? String(e2.id) : null;
+
+          if (userAId) {
+            reservedA = await tryReserveActiveRoom(userAId, fallbackRoomId);
+            if (!reservedA.ok)
+              throw reservedA.error || new Error("reserve-A failed");
+            if (!reservedA.set) {
+              // cannot reserve A, abort fallback
+              if (ioServer && ioServer.sockets.sockets.get(e1.socketId)) {
+                ioServer.to(e1.socketId).emit("match-found-failed", {
+                  ok: false,
+                  error: "player-busy",
+                });
+              }
+              if (userBId && reservedB.set)
+                await releaseActiveRoom(userBId, fallbackRoomId);
+              continue;
+            }
+          }
+
+          if (userBId) {
+            reservedB = await tryReserveActiveRoom(userBId, fallbackRoomId);
+            if (!reservedB.ok) {
+              // rollback A
+              if (reservedA.set && userAId) {
+                await releaseActiveRoom(userAId, fallbackRoomId);
+              }
+              throw reservedB.error || new Error("reserve-B failed");
+            }
+            if (!reservedB.set) {
+              // rollback A
+              if (reservedA.set && userAId) {
+                await releaseActiveRoom(userAId, fallbackRoomId);
+              }
+              if (ioServer && ioServer.sockets.sockets.get(e2.socketId)) {
+                ioServer.to(e2.socketId).emit("match-found-failed", {
+                  ok: false,
+                  error: "player-busy",
+                });
+              }
+              continue;
+            }
+          }
+
+          // Build fallback room (safe now)
           const room = {
             players: [],
             moves: [],
@@ -445,6 +617,14 @@ async function attemptMatchmaking() {
           createdRoomId = fallbackRoomId;
         } catch (err) {
           console.error("play-online: fallback room creation failed", err);
+          // try to rollback any reservations if present
+          try {
+            // best-effort: release any reserved DB activeRoom set to that fallback id
+            if (e1.id)
+              await releaseActiveRoom(String(e1.id), createdRoomId || null);
+            if (e2.id)
+              await releaseActiveRoom(String(e2.id), createdRoomId || null);
+          } catch (e) {}
           createdRoomId = null;
         }
       }
@@ -702,7 +882,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
     } catch (e) {}
 
     /* -------------------------
-       Existing listeners (kept intact)
+       Event handlers (full; kept your logic intact)
        ------------------------- */
 
     socket.on("check-room", async ({ roomId }, cb) => {
@@ -764,89 +944,136 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
             }
           }
 
-          rooms[roomId] = {
-            players: [],
-            moves: [],
-            chess: new Chess(),
-            fen: null,
-            lastIndex: -1,
-            clocks: null,
-            paused: false,
-            disconnectTimers: {},
-            firstMoveTimer: null,
-            pendingDrawOffer: null,
-            finished: null,
-            settings: {
-              minutes: minutesNum,
-              minutesMs,
-              creatorId: socket.user?.id || socket.id,
-              colorPreference: colorPreference || "random",
-            },
-            messages: [],
-            rematch: null,
-          };
+          // Before assigning playing seat, if this user is authenticated attempt to reserve db activeRoom
+          (async () => {
+            try {
+              if (socket.user && socket.user.id) {
+                const r = await tryReserveActiveRoom(socket.user.id, roomId);
+                if (!r.ok) {
+                  socket.emit("room-created", {
+                    ok: false,
+                    error: "server-error",
+                  });
+                  return;
+                }
+                if (!r.set) {
+                  socket.emit("room-created", {
+                    ok: false,
+                    error: "already-in-active-room",
+                    activeRoom: (
+                      await User.findById(socket.user.id).lean().exec()
+                    ).activeRoom,
+                  });
+                  return;
+                }
+              }
 
-          const room = rooms[roomId];
+              rooms[roomId] = {
+                players: [],
+                moves: [],
+                chess: new Chess(),
+                fen: null,
+                lastIndex: -1,
+                clocks: null,
+                paused: false,
+                disconnectTimers: {},
+                firstMoveTimer: null,
+                pendingDrawOffer: null,
+                finished: null,
+                settings: {
+                  minutes: minutesNum,
+                  minutesMs,
+                  creatorId: socket.user?.id || socket.id,
+                  colorPreference: colorPreference || "random",
+                },
+                messages: [],
+                rematch: null,
+              };
 
-          let assignedColor = "spectator";
-          if (socket.user) {
-            const playerObj = {
-              id: socket.id,
-              user: socket.user || user || { username: "guest" },
-              color: "spectator",
-              online: true,
-              disconnectedAt: null,
-            };
+              const room = rooms[roomId];
 
-            playerObj.user = ensureAvatarAbs(playerObj.user);
+              let assignedColor = "spectator";
+              if (socket.user) {
+                const playerObj = {
+                  id: socket.id,
+                  user: socket.user || user || { username: "guest" },
+                  color: "spectator",
+                  online: true,
+                  disconnectedAt: null,
+                };
 
-            const pref = room.settings.colorPreference;
-            const wTaken = room.players.some((p) => p.color === "w");
-            const bTaken = room.players.some((p) => p.color === "b");
+                playerObj.user = ensureAvatarAbs(playerObj.user);
 
-            if (pref === "white" && !wTaken) assignedColor = "w";
-            else if (pref === "black" && !bTaken) assignedColor = "b";
-            else {
-              if (!wTaken) assignedColor = "w";
-              else if (!bTaken) assignedColor = "b";
-              else assignedColor = "spectator";
+                const pref = room.settings.colorPreference;
+                const wTaken = room.players.some((p) => p.color === "w");
+                const bTaken = room.players.some((p) => p.color === "b");
+
+                if (pref === "white" && !wTaken) assignedColor = "w";
+                else if (pref === "black" && !bTaken) assignedColor = "b";
+                else {
+                  if (!wTaken) assignedColor = "w";
+                  else if (!bTaken) assignedColor = "b";
+                  else assignedColor = "spectator";
+                }
+
+                playerObj.color = assignedColor;
+                room.players.push(playerObj);
+                socket.emit("player-assigned", { color: playerObj.color });
+
+                // mark DB user activeRoom if they are a colored (playing) seat
+                if (
+                  playerObj.user &&
+                  (playerObj.color === "w" || playerObj.color === "b")
+                ) {
+                  try {
+                    await markUserActiveRoom(
+                      playerObj.user.id || playerObj.user._id,
+                      roomId
+                    );
+                  } catch (e) {
+                    console.error(
+                      "markUserActiveRoom after create-room failed",
+                      e
+                    );
+                  }
+                }
+              } else {
+                const playerObj = {
+                  id: socket.id,
+                  user: user || { username: "guest" },
+                  color: "spectator",
+                  online: true,
+                  disconnectedAt: null,
+                };
+                playerObj.user = ensureAvatarAbs(playerObj.user);
+
+                room.players.push(playerObj);
+                assignedColor = "spectator";
+                socket.emit("player-assigned", { color: "spectator" });
+              }
+
+              broadcastRoomState(roomId);
+
+              socket.join(roomId);
+              socket.emit("room-created", {
+                ok: true,
+                roomId,
+                settings: room.settings,
+                assignedColor,
+              });
+              console.log(
+                "Room created:",
+                roomId,
+                "by",
+                socket.user?.username || socket.id
+              );
+            } catch (err) {
+              console.error("create-room error", err);
+              socket.emit("room-created", { ok: false, error: "Server error" });
             }
-
-            playerObj.color = assignedColor;
-            room.players.push(playerObj);
-            socket.emit("player-assigned", { color: playerObj.color });
-          } else {
-            const playerObj = {
-              id: socket.id,
-              user: user || { username: "guest" },
-              color: "spectator",
-              online: true,
-              disconnectedAt: null,
-            };
-            playerObj.user = ensureAvatarAbs(playerObj.user);
-
-            room.players.push(playerObj);
-            assignedColor = "spectator";
-            socket.emit("player-assigned", { color: "spectator" });
-          }
-
-          broadcastRoomState(roomId);
-
-          socket.join(roomId);
-          socket.emit("room-created", {
-            ok: true,
-            roomId,
-            settings: room.settings,
-            assignedColor,
-          });
-          console.log(
-            "Room created:",
-            roomId,
-            "by",
-            socket.user?.username || socket.id
-          );
+          })();
         } catch (err) {
-          console.error("create-room error", err);
+          console.error("create-room outer error", err);
           socket.emit("room-created", { ok: false, error: "Server error" });
         }
       }
@@ -855,6 +1082,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
     socket.on("join-room", async ({ roomId, user }) => {
       if (!roomId) return;
 
+      // If room not present in memory, attempt to load persisted snapshot (existing logic kept)
       if (!rooms[roomId]) {
         try {
           const doc = await Room.findOne({ roomId }).lean().exec();
@@ -916,8 +1144,8 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         }
       }
 
+      // join in-memory flow (original)
       socket.join(roomId);
-
       const room = rooms[roomId];
 
       if (!room.chess) {
@@ -935,6 +1163,36 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         (user && user.fromUsername) ??
         null;
 
+      // --- NEW: server-side guard: if DB user already has activeRoom (different), deny join ---
+      if (candidateUserId) {
+        try {
+          const dbUser = await User.findById(candidateUserId).lean().exec();
+          if (
+            dbUser &&
+            dbUser.activeRoom &&
+            String(dbUser.activeRoom) !== String(roomId)
+          ) {
+            try {
+              socket.emit("join-denied-active-room", {
+                reason: "already_active",
+                message: "You already have an active game.",
+                activeRoom: dbUser.activeRoom,
+              });
+              // also emit a notification fallback for clients that rely on 'notification' relay
+              socket.emit("notification", {
+                type: "join_denied_active_room",
+                activeRoom: dbUser.activeRoom,
+                message: "You already have an active game.",
+              });
+            } catch (e) {}
+            return;
+          }
+        } catch (err) {
+          console.error("join-room: error checking user activeRoom", err);
+        }
+      }
+
+      // --- locate existing player entry (original logic) ---
       let existing = null;
       if (candidateUserId) {
         existing = room.players.find(
@@ -963,7 +1221,24 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         socket.emit("player-assigned", {
           color: existing.color || "spectator",
         });
+
+        // mark DB user activeRoom if they are a colored (playing) seat
+        if (
+          existing.user &&
+          (existing.color === "w" || existing.color === "b")
+        ) {
+          try {
+            const uid = existing.user.id || existing.user._id;
+            await markUserActiveRoom(uid, roomId);
+          } catch (e) {
+            console.error(
+              "markUserActiveRoom after existing player assignment failed",
+              e
+            );
+          }
+        }
       } else {
+        // create new player object (original)
         let assignedColor = "spectator";
         if (socket.user) {
           const wTaken = room.players.some((p) => p.color === "w");
@@ -986,10 +1261,22 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
 
         room.players.push(playerObj);
         socket.emit("player-assigned", { color: playerObj.color });
+
+        // mark DB user activeRoom if assigned color w/b and user exists
+        try {
+          const uid =
+            playerObj.user && (playerObj.user.id || playerObj.user._id);
+          if (uid && (playerObj.color === "w" || playerObj.color === "b")) {
+            await markUserActiveRoom(uid, roomId);
+          }
+        } catch (e) {
+          console.error("markUserActiveRoom error after new player push", e);
+        }
       }
 
       clearDisconnectTimer(room, socket.id);
 
+      // clocks / ready notifications (original logic)
       const coloredPlayers = room.players.filter(
         (p) => p.color === "w" || p.color === "b"
       );
@@ -1331,37 +1618,49 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
 
     socket.on("resign", async ({ roomId }) => {
       if (!roomId) return;
-      const room = rooms[roomId];
-      if (!room) return;
-      const playerIdx = room.players.findIndex((p) => p.id === socket.id);
-      if (playerIdx === -1) return;
-      const player = room.players[playerIdx];
+      try {
+        const room = rooms[roomId];
+        if (!room) return;
+        const playerIdx = room.players.findIndex((p) => p.id === socket.id);
+        if (playerIdx === -1) return;
+        const player = room.players[playerIdx];
 
-      if (player.color === "w" || player.color === "b") {
-        const winnerColor = player.color === "w" ? "b" : "w";
-        room.paused = true;
-        if (room.clocks) {
-          room.clocks.running = null;
-          room.clocks.lastTick = null;
+        if ((player.color === "w" || player.color === "b") && !room.finished) {
+          const winnerColor = player.color === "w" ? "b" : "w";
+          room.paused = true;
+          if (room.clocks) {
+            room.clocks.running = null;
+            room.clocks.lastTick = null;
+          }
+          room.finished = {
+            reason: "resign",
+            winner: winnerColor,
+            loser: player.color,
+            message: `Player ${player.user?.username || player.id} resigned`,
+            finishedAt: Date.now(),
+          };
+          io.to(roomId).emit("game-over", { ...room.finished });
+          clearFirstMoveTimer(room);
+          Object.keys(room.disconnectTimers || {}).forEach((sid) =>
+            clearDisconnectTimer(room, sid)
+          );
+          broadcastRoomState(roomId);
+
+          // --- NEW: clear DB activeRoom for both players in this room ---
+          try {
+            await clearActiveRoomForRoom(room);
+          } catch (e) {
+            console.error("clearActiveRoomForRoom after resign failed", e);
+          }
+
+          await saveFinishedGame(roomId);
         }
-        room.finished = {
-          reason: "resign",
-          winner: winnerColor,
-          loser: player.color,
-          message: `Player ${player.user?.username || player.id} resigned`,
-          finishedAt: Date.now(),
-        };
-        io.to(roomId).emit("game-over", { ...room.finished });
-        clearFirstMoveTimer(room);
-        Object.keys(room.disconnectTimers || {}).forEach((sid) =>
-          clearDisconnectTimer(room, sid)
-        );
-        broadcastRoomState(roomId);
-        await saveFinishedGame(roomId);
-      }
 
-      room.players = room.players.filter((p) => p.id !== socket.id);
-      broadcastRoomState(roomId);
+        room.players = room.players.filter((p) => p.id !== socket.id);
+        broadcastRoomState(roomId);
+      } catch (err) {
+        console.error("resign handler error", err);
+      }
     });
 
     socket.on("offer-draw", async ({ roomId }) => {
@@ -1727,7 +2026,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         })(),
         settings: r.settings || null,
         messages: (r.messages || []).slice(
-          -Math.min(MAX_CHAT_MESSAGES, r.messages.length)
+          -Math.min(MAX_CHAT_MESSAGES, r.messages || 0)
         ),
         pendingRematch: r.rematch
           ? {
@@ -1741,7 +2040,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       });
     });
 
-    // ------------- NEW: leave-room, save-game, play-again, accept-play-again, decline-play-again, challenge, accept/decline-challenge, friend requests etc. -------------
+    // leave-room handler with DB clear (kept your logic and improved clearing)
     socket.on("leave-room", async ({ roomId }) => {
       if (!roomId || !rooms[roomId]) return;
       const room = rooms[roomId];
@@ -1773,14 +2072,29 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         await saveFinishedGame(roomId);
       }
 
+      // remove the player socket entry
       room.players = room.players.filter((p) => p.id !== socket.id);
       broadcastRoomState(roomId);
+
+      // Best-effort: clear activeRoom for this user in DB (if authenticated)
+      try {
+        const uid = normId(player?.user?.id || player?.user?._id || null);
+        if (uid) {
+          await User.updateOne(
+            { _id: uid },
+            { $set: { activeRoom: null } }
+          ).exec();
+        }
+      } catch (e) {
+        console.warn("leave-room: failed to clear activeRoom (non-fatal):", e);
+      }
     });
 
     socket.on("save-game", ({ roomId, fen, moves, players }) => {
       io.to(roomId).emit("game-saved", { ok: true });
     });
 
+    // play-again / rematch (kept intact)
     socket.on("play-again", async ({ roomId }) => {
       try {
         if (!roomId) return;
@@ -2073,6 +2387,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
+    // challenge / accept-challenge (critical section — fixed)
     socket.on(
       "challenge",
       async ({ toUserId, minutes = 5, colorPreference = "random" }) => {
@@ -2184,192 +2499,276 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           return;
         }
 
+        // ---------- NEW: attempt to reserve both users BEFORE creating the room ----------
         let roomId = generateRoomCode(8);
         while (rooms[roomId]) roomId = generateRoomCode(8);
 
-        const room = {
-          players: [],
-          moves: [],
-          chess: new Chess(),
-          fen: null,
-          lastIndex: -1,
-          clocks: null,
-          paused: false,
-          disconnectTimers: {},
-          firstMoveTimer: null,
-          pendingDrawOffer: null,
-          finished: null,
-          settings: {
-            minutes: pending.minutes,
-            minutesMs: pending.minutes * 60 * 1000,
-            creatorId: pending.fromUserId,
-            colorPreference: pending.colorPreference || "random",
-          },
-          messages: [],
-          rematch: null,
-        };
+        let reservedInitiator = { ok: true, set: false };
+        let reservedAcceptor = { ok: true, set: false };
+        const initiatorUserId = pending.fromUserId;
+        const acceptorUserId_local = pending.toUserId; // avoid duplicate var name
 
-        let initiatorUser = null;
-        let acceptorUser = null;
         try {
-          initiatorUser = await User.findById(pending.fromUserId)
-            .select("-passwordHash")
-            .lean();
-        } catch (e) {}
-        try {
-          acceptorUser = await User.findById(pending.toUserId)
-            .select("-passwordHash")
-            .lean();
-        } catch (e) {}
+          if (initiatorUserId) {
+            reservedInitiator = await tryReserveActiveRoom(
+              initiatorUserId,
+              roomId
+            );
+            if (!reservedInitiator.ok) {
+              throw reservedInitiator.error || new Error("reserve-init failed");
+            }
+            if (!reservedInitiator.set) {
+              // initiator already busy
+              if (initiatorSocket) {
+                initiatorSocket.emit("challenge-declined", {
+                  challengeId,
+                  reason: "already-in-active-room",
+                });
+              }
+              if (acceptorSocket) {
+                acceptorSocket.emit("challenge-accept-response", {
+                  ok: false,
+                  error: "opponent-busy",
+                });
+              }
+              delete pendingChallenges[challengeId];
+              return;
+            }
+          }
 
-        if (initiatorUser) initiatorUser = ensureAvatarAbs(initiatorUser);
-        if (acceptorUser) acceptorUser = ensureAvatarAbs(acceptorUser);
+          if (acceptorUserId_local) {
+            reservedAcceptor = await tryReserveActiveRoom(
+              acceptorUserId_local,
+              roomId
+            );
+            if (!reservedAcceptor.ok) {
+              // rollback initiator if set
+              if (reservedInitiator.set && initiatorUserId) {
+                await releaseActiveRoom(initiatorUserId, roomId);
+              }
+              throw (
+                reservedAcceptor.error || new Error("reserve-accept failed")
+              );
+            }
+            if (!reservedAcceptor.set) {
+              // acceptor already busy (rare)
+              if (reservedInitiator.set && initiatorUserId) {
+                await releaseActiveRoom(initiatorUserId, roomId);
+              }
+              acceptorSocket.emit("challenge-accept-response", {
+                ok: false,
+                error: "already-in-active-room",
+              });
+              delete pendingChallenges[challengeId];
+              return;
+            }
+          }
 
-        const initiatorPlayer = {
-          id: pending.fromSocketId,
-          user: initiatorUser || {
-            id: pending.fromUserId,
-            username: initiatorUser?.username || "guest",
-          },
-          color: "w",
-          online: true,
-          disconnectedAt: null,
-        };
-        const acceptorPlayer = {
-          id: acceptorSocket.id,
-          user: acceptorUser || {
-            id: pending.toUserId,
-            username: acceptorUser?.username || "guest",
-          },
-          color: "b",
-          online: true,
-          disconnectedAt: null,
-        };
+          // create room object (same as original) - now safe because reservations present
+          const room = {
+            players: [],
+            moves: [],
+            chess: new Chess(),
+            fen: null,
+            lastIndex: -1,
+            clocks: null,
+            paused: false,
+            disconnectTimers: {},
+            firstMoveTimer: null,
+            pendingDrawOffer: null,
+            finished: null,
+            settings: {
+              minutes: pending.minutes,
+              minutesMs: pending.minutes * 60 * 1000,
+              creatorId: pending.fromUserId,
+              colorPreference: pending.colorPreference || "random",
+            },
+            messages: [],
+            rematch: null,
+          };
 
-        initiatorPlayer.user = ensureAvatarAbs(initiatorPlayer.user);
-        acceptorPlayer.user = ensureAvatarAbs(acceptorPlayer.user);
+          let initiatorUser = null;
+          let acceptorUser = null;
+          try {
+            initiatorUser = await User.findById(pending.fromUserId)
+              .select("-passwordHash")
+              .lean();
+          } catch (e) {}
+          try {
+            acceptorUser = await User.findById(pending.toUserId)
+              .select("-passwordHash")
+              .lean();
+          } catch (e) {}
 
-        if (pending.colorPreference === "white") {
-          initiatorPlayer.color = "w";
-          acceptorPlayer.color = "b";
-        } else if (pending.colorPreference === "black") {
-          initiatorPlayer.color = "b";
-          acceptorPlayer.color = "w";
-        } else {
-          if (Math.random() < 0.5) {
+          if (initiatorUser) initiatorUser = ensureAvatarAbs(initiatorUser);
+          if (acceptorUser) acceptorUser = ensureAvatarAbs(acceptorUser);
+
+          const initiatorPlayer = {
+            id: pending.fromSocketId,
+            user: initiatorUser || {
+              id: pending.fromUserId,
+              username: initiatorUser?.username || "guest",
+            },
+            color: "w",
+            online: true,
+            disconnectedAt: null,
+          };
+          const acceptorPlayer = {
+            id: acceptorSocket.id,
+            user: acceptorUser || {
+              id: pending.toUserId,
+              username: acceptorUser?.username || "guest",
+            },
+            color: "b",
+            online: true,
+            disconnectedAt: null,
+          };
+
+          initiatorPlayer.user = ensureAvatarAbs(initiatorPlayer.user);
+          acceptorPlayer.user = ensureAvatarAbs(acceptorPlayer.user);
+
+          if (pending.colorPreference === "white") {
             initiatorPlayer.color = "w";
             acceptorPlayer.color = "b";
-          } else {
+          } else if (pending.colorPreference === "black") {
             initiatorPlayer.color = "b";
             acceptorPlayer.color = "w";
+          } else {
+            if (Math.random() < 0.5) {
+              initiatorPlayer.color = "w";
+              acceptorPlayer.color = "b";
+            } else {
+              initiatorPlayer.color = "b";
+              acceptorPlayer.color = "w";
+            }
           }
-        }
 
-        room.players.push(initiatorPlayer);
-        room.players.push(acceptorPlayer);
+          room.players.push(initiatorPlayer);
+          room.players.push(acceptorPlayer);
 
-        room.clocks = {
-          w: room.settings.minutesMs,
-          b: room.settings.minutesMs,
-          running: room.chess.turn(),
-          lastTick: Date.now(),
-        };
+          room.clocks = {
+            w: room.settings.minutesMs,
+            b: room.settings.minutesMs,
+            running: room.chess.turn(),
+            lastTick: Date.now(),
+          };
 
-        rooms[roomId] = room;
+          rooms[roomId] = room;
 
-        const initiatorSockObj = io.sockets.sockets.get(pending.fromSocketId);
-        const acceptorSockObj = acceptorSocket;
-        if (initiatorSockObj) initiatorSockObj.join(roomId);
-        if (acceptorSockObj) acceptorSockObj.join(roomId);
+          const initiatorSockObj = io.sockets.sockets.get(pending.fromSocketId);
+          const acceptorSockObj = acceptorSocket;
+          if (initiatorSockObj) initiatorSockObj.join(roomId);
+          if (acceptorSockObj) acceptorSockObj.join(roomId);
 
-        broadcastRoomState(roomId);
+          broadcastRoomState(roomId);
 
-        const payload = {
-          ok: true,
-          challengeId,
-          roomId,
-          message: "Challenge accepted — room created",
-          assignedColors: {
-            [pending.fromUserId]: initiatorPlayer.color,
-            [pending.toUserId]: acceptorPlayer.color,
-          },
-          redirectPath: "/play",
-        };
-        initiatorSockObj &&
-          initiatorSockObj.emit("challenge-accepted", payload);
-        acceptorSockObj && acceptorSockObj.emit("challenge-accepted", payload);
-
-        // Persist notifications to both parties
-        try {
-          await notificationService.createNotification(
-            String(pending.fromUserId),
-            "challenge_accepted",
-            "Challenge accepted",
-            `${acceptorUser?.username || "Player"} accepted your challenge.`,
-            { challengeId, roomId }
-          );
-        } catch (e) {
-          console.error("createNotification (challenge_accepted) failed", e);
-        }
-
-        try {
-          await notificationService.createNotification(
-            String(pending.toUserId),
-            "challenge_joined",
-            "Challenge joined",
-            `You accepted a challenge — room ${roomId} created.`,
-            { challengeId, roomId }
-          );
-        } catch (e) {
-          console.error("createNotification (challenge_joined) failed", e);
-        }
-
-        // --- FINAL FIX: mark original challenge notification for the acceptor as read + emit update ---
-        try {
-          const orig = await Notification.findOneAndUpdate(
-            {
-              "data.challengeId": challengeId,
-              userId: String(pending.toUserId),
+          const payload = {
+            ok: true,
+            challengeId,
+            roomId,
+            message: "Challenge accepted — room created",
+            assignedColors: {
+              [pending.fromUserId]: initiatorPlayer.color,
+              [pending.toUserId]: acceptorPlayer.color,
             },
-            {
-              $set: {
-                read: true,
-                updatedAt: Date.now(),
-                "data.status": "accepted",
+            redirectPath: "/play",
+          };
+          initiatorSockObj &&
+            initiatorSockObj.emit("challenge-accepted", payload);
+          acceptorSockObj &&
+            acceptorSockObj.emit("challenge-accepted", payload);
+
+          // Persist notifications to both parties
+          try {
+            await notificationService.createNotification(
+              String(pending.fromUserId),
+              "challenge_accepted",
+              "Challenge accepted",
+              `${acceptorUser?.username || "Player"} accepted your challenge.`,
+              { challengeId, roomId }
+            );
+          } catch (e) {
+            console.error("createNotification (challenge_accepted) failed", e);
+          }
+
+          try {
+            await notificationService.createNotification(
+              String(pending.toUserId),
+              "challenge_joined",
+              "Challenge joined",
+              `You accepted a challenge — room ${roomId} created.`,
+              { challengeId, roomId }
+            );
+          } catch (e) {
+            console.error("createNotification (challenge_joined) failed", e);
+          }
+
+          // --- FINAL FIX: mark original challenge notification for the acceptor as read + emit update ---
+          try {
+            const orig = await Notification.findOneAndUpdate(
+              {
+                "data.challengeId": challengeId,
+                userId: String(pending.toUserId),
               },
-            },
-            { new: true }
-          )
-            .lean()
-            .exec();
-          if (orig) {
-            try {
-              const payload = {
-                id: orig._id?.toString(),
-                _id: orig._id?.toString(),
-                userId: orig.userId,
-                type: orig.type,
-                title: orig.title,
-                body: orig.body,
-                data: orig.data,
-                read: orig.read,
-                createdAt: orig.createdAt,
-                updatedAt: orig.updatedAt,
-              };
-              io.to(`user:${String(pending.toUserId)}`).emit(
-                "notification",
-                payload
-              );
-            } catch (e) {}
+              {
+                $set: {
+                  read: true,
+                  updatedAt: Date.now(),
+                  "data.status": "accepted",
+                },
+              },
+              { new: true }
+            )
+              .lean()
+              .exec();
+            if (orig) {
+              try {
+                const payload = {
+                  id: orig._id?.toString(),
+                  _id: orig._id?.toString(),
+                  userId: orig.userId,
+                  type: orig.type,
+                  title: orig.title,
+                  body: orig.body,
+                  data: orig.data,
+                  read: orig.read,
+                  createdAt: orig.createdAt,
+                  updatedAt: orig.updatedAt,
+                };
+                io.to(`user:${String(pending.toUserId)}`).emit(
+                  "notification",
+                  payload
+                );
+              } catch (e) {}
+            }
+          } catch (e) {
+            console.error(
+              "accept-challenge: mark original notification handled failed",
+              e
+            );
           }
-        } catch (e) {
-          console.error(
-            "accept-challenge: mark original notification handled failed",
-            e
-          );
-        }
 
-        delete pendingChallenges[challengeId];
+          delete pendingChallenges[challengeId];
+        } catch (err) {
+          console.error("accept-challenge error", err);
+          // rollback reservations if necessary
+          try {
+            if (
+              reservedInitiator &&
+              reservedInitiator.set &&
+              pending.fromUserId
+            ) {
+              await releaseActiveRoom(pending.fromUserId, roomId);
+            }
+            if (reservedAcceptor && reservedAcceptor.set && pending.toUserId) {
+              await releaseActiveRoom(pending.toUserId, roomId);
+            }
+          } catch (e) {}
+          socket.emit("challenge-accept-response", {
+            ok: false,
+            error: "Server error",
+          });
+        }
       } catch (err) {
         console.error("accept-challenge error", err);
         socket.emit("challenge-accept-response", {
@@ -2457,6 +2856,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
+    // friend request handlers (kept intact)
     socket.on("send-friend-request", async ({ toUserId }, callback) => {
       try {
         if (!socket.user || !socket.user.id) {
@@ -2797,7 +3197,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
        Matchmaking events (support both name styles)
        ------------------------ */
 
-    // New: support enqueue-match (client uses this)
+    // enqueue-match
     socket.on("enqueue-match", async (payload = {}) => {
       try {
         const userId = socket.user?.id || null;
@@ -2834,7 +3234,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
-    // New: support dequeue-match (client uses this)
+    // dequeue-match
     socket.on("dequeue-match", () => {
       try {
         const removed = removeFromPlayQueueBySocket(socket.id);
@@ -2845,28 +3245,15 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
-    // --- WebRTC voice signaling (paste into your socket connection handler) ---
-    /**
-     * Minimal signaling transport for WebRTC audio between two playing sockets.
-     * Clients emit:
-     *  - "webrtc-offer": { roomId, toSocketId, offer }
-     *  - "webrtc-answer": { roomId, toSocketId, answer }
-     *  - "webrtc-ice": { roomId, toSocketId, candidate }
-     *  - "webrtc-hangup": { roomId, toSocketId? }
-     *
-     * Server simply relays messages to the specified target socket (best-effort).
-     */
-    // --- robust relay helper for WebRTC signaling ---
+    // WebRTC signalling helpers (kept)
     function relayToSocketOrUser(targetId, eventName, payload) {
       try {
-        // try as socket id first
         const sock = io && io.sockets && io.sockets.sockets.get(targetId);
         if (sock) {
           io.to(targetId).emit(eventName, payload);
           return true;
         }
 
-        // otherwise treat as userId and send to all sockets for that user
         const sids = getSocketsForUserId(targetId);
         if (Array.isArray(sids) && sids.length > 0) {
           for (const sid of sids) {
@@ -2884,18 +3271,15 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     }
 
-    // webrtc-offer
     socket.on("webrtc-offer", ({ roomId, toSocketId, offer }) => {
       try {
         const payload = { fromSocketId: socket.id, offer };
 
         if (toSocketId) {
-          // best-effort: try socket id, then user id
           relayToSocketOrUser(toSocketId, "webrtc-offer", payload);
           return;
         }
 
-        // fallback: find opponent in room (existing behavior)
         if (roomId && rooms[roomId]) {
           const opponent = (rooms[roomId].players || []).find(
             (p) => p.id !== socket.id && (p.color === "w" || p.color === "b")
@@ -2909,7 +3293,6 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
-    // webrtc-answer
     socket.on("webrtc-answer", ({ roomId, toSocketId, answer }) => {
       try {
         const payload = { fromSocketId: socket.id, answer };
@@ -2932,7 +3315,6 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
-    // webrtc-ice
     socket.on("webrtc-ice", ({ roomId, toSocketId, candidate }) => {
       try {
         const payload = { fromSocketId: socket.id, candidate };
@@ -2955,7 +3337,6 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
-    // webrtc-hangup
     socket.on("webrtc-hangup", ({ roomId, toSocketId }) => {
       try {
         const payload = { fromSocketId: socket.id };
@@ -2978,7 +3359,7 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     });
 
-    // Also keep legacy names (backwards compatible)
+    // Legacy play-online API
     socket.on("play-online", async (payload = {}) => {
       try {
         const userId = socket.user?.id || null;
@@ -3073,9 +3454,20 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
                 io.to(rId).emit("game-over", { ...room.finished });
                 clearFirstMoveTimer(room);
                 broadcastRoomState(rId);
+
+                // --- NEW: clear DB activeRoom for both players ---
+                try {
+                  await clearActiveRoomForRoom(room);
+                } catch (e) {
+                  console.error(
+                    "clearActiveRoomForRoom failed in disconnect timer",
+                    e
+                  );
+                }
+
                 await saveFinishedGame(rId);
               } else {
-                // no online opponent — leave offline
+                // no online opponent — leave offline (no immediate finish)
               }
             }
             clearDisconnectTimer(room, socket.id);
@@ -3091,4 +3483,4 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
   return io;
 }
 
-module.exports = { initSockets: initSockets, initSockets: initSockets };
+module.exports = { initSockets };

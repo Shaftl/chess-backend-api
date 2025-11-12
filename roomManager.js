@@ -64,6 +64,7 @@ function clearFirstMoveTimer(room) {
  * saveFinishedGame(roomId)
  * Saves the finished in-memory room snapshot into Mongo (Game model) and —
  * applies cups adjustments: winner +delta, loser -delta.
+ * Also clears activeRoom/status for real users in the room.
  */
 async function saveFinishedGame(roomId) {
   try {
@@ -167,7 +168,7 @@ async function saveFinishedGame(roomId) {
         resStr === "stalemate" ||
         resStr.includes("draw")
       ) {
-        return;
+        // draw, skip rating changes
       }
       if (finished.loserId || finished.loser) {
         const lid = finished.loserId || finished.loser;
@@ -189,15 +190,15 @@ async function saveFinishedGame(roomId) {
     }
 
     if (!winnerId || !loserId) {
-      return;
+      // skip rating if we don't have both
     }
 
-    const winnerUser = await User.findById(String(winnerId))
-      .select("cups")
-      .exec();
-    const loserUser = await User.findById(String(loserId))
-      .select("cups")
-      .exec();
+    const winnerUser = winnerId
+      ? await User.findById(String(winnerId)).select("cups").exec()
+      : null;
+    const loserUser = loserId
+      ? await User.findById(String(loserId)).select("cups").exec()
+      : null;
     const winnerRating = Number(winnerUser?.cups || 1200);
     const loserRating = Number(loserUser?.cups || 1200);
 
@@ -247,7 +248,7 @@ async function saveFinishedGame(roomId) {
 
     let delta = 10;
     try {
-      if (analysis) {
+      if (analysis && winnerUser && loserUser) {
         delta = computeDeltaForWinner(
           winnerRating,
           loserRating,
@@ -256,12 +257,14 @@ async function saveFinishedGame(roomId) {
           maxSwingCp,
           /*gamesplayed*/ 50
         );
-      } else {
+      } else if (winnerUser && loserUser) {
         const expected =
           1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
         const K = 20;
         delta = Math.max(1, Math.round(K * (1 - expected)));
         if (delta < 10) delta = 10;
+      } else {
+        delta = 10;
       }
     } catch (e) {
       delta = 10;
@@ -284,17 +287,35 @@ async function saveFinishedGame(roomId) {
       }
     }
 
-    if (winnerUser) {
+    if (winnerUser && loserUser) {
       const newWinner = Math.max(
         0,
         Number(winnerUser.cups || 0) + Number(delta)
       );
       await adjustUserCupsAndNotify(winnerUser._id, newWinner, delta);
-    }
 
-    if (loserUser) {
       const newLoser = Math.max(0, Number(loserUser.cups || 0) - Number(delta));
       await adjustUserCupsAndNotify(loserUser._id, newLoser, -delta);
+    }
+
+    // --- Clear activeRoom and set status idle for participants (best-effort)
+    try {
+      const participantIds = (room.players || [])
+        .map((p) => playerUserId(p))
+        .filter(Boolean);
+      if (participantIds.length > 0) {
+        await User.updateMany(
+          { _id: { $in: participantIds } },
+          { $set: { activeRoom: null, status: "idle" } }
+        ).exec();
+        for (const uid of participantIds) {
+          try {
+            notifyUser(String(uid), "active-room-cleared", { roomId });
+          } catch (e) {}
+        }
+      }
+    } catch (e) {
+      // non-fatal
     }
   } catch (err) {
     console.error("cups update error after saving game:", err);
@@ -524,8 +545,7 @@ function broadcastRoomState(roomId) {
 /**
  * createRoom(options)
  * Creates a new in-memory room (and persists initial snapshot via broadcastRoomState).
- * options: { minutes, colorPreference, userA: {id, username}, userB: {id, username}, roomId (optional) }
- * Returns: { roomId } or null
+ * Enforces single active room per user via DB updates.
  */
 async function createRoom(options = {}) {
   try {
@@ -559,6 +579,86 @@ async function createRoom(options = {}) {
         acceptorUser = await User.findById(userB.id).lean().exec();
     } catch (e) {}
 
+    // ENFORCE single active room per user (server-side) using conditional update
+    const setIfFree = async (userObj, rid) => {
+      if (!userObj || !userObj.id) return { ok: true, set: false };
+      const uid = String(userObj.id);
+      try {
+        // try to set activeRoom only if it's null or empty string
+        const updated = await User.findOneAndUpdate(
+          { _id: uid, $or: [{ activeRoom: null }, { activeRoom: "" }] },
+          { $set: { activeRoom: rid, status: "playing" } },
+          { new: true }
+        ).exec();
+        if (updated) return { ok: true, set: true };
+        return { ok: true, set: false };
+      } catch (e) {
+        return { ok: false, error: e };
+      }
+    };
+
+    // we will attempt to reserve activeRoom for userA and userB (if they exist)
+    const reserveId = roomId;
+    let reservedA = { ok: true, set: false };
+    let reservedB = { ok: true, set: false };
+
+    if (initiatorUser && initiatorUser._id) {
+      reservedA = await setIfFree(initiatorUser, reserveId);
+      if (!reservedA.ok) {
+        // DB error -> abort
+        return null;
+      }
+      if (!reservedA.set) {
+        // already has activeRoom -> abort
+        try {
+          if (io && userA && userA.id) {
+            io.to(userA.id).emit("create-room-failed", {
+              error: "already-in-active-room",
+              activeRoom: initiatorUser.activeRoom,
+            });
+          }
+        } catch (e) {}
+        return null;
+      }
+    }
+
+    if (acceptorUser && acceptorUser._id) {
+      reservedB = await setIfFree(acceptorUser, reserveId);
+      if (!reservedB.ok) {
+        // DB error - rollback A if reserved
+        if (reservedA.set && initiatorUser && initiatorUser._id) {
+          try {
+            await User.findByIdAndUpdate(initiatorUser._id, {
+              activeRoom: null,
+              status: "idle",
+            }).exec();
+          } catch (e) {}
+        }
+        return null;
+      }
+      if (!reservedB.set) {
+        // acceptor already in active room - rollback A
+        if (reservedA.set && initiatorUser && initiatorUser._id) {
+          try {
+            await User.findByIdAndUpdate(initiatorUser._id, {
+              activeRoom: null,
+              status: "idle",
+            }).exec();
+          } catch (e) {}
+        }
+        try {
+          if (io && userB && userB.id) {
+            io.to(userB.id).emit("create-room-failed", {
+              error: "already-in-active-room",
+              activeRoom: acceptorUser.activeRoom,
+            });
+          }
+        } catch (e) {}
+        return null;
+      }
+    }
+
+    // If we get here, either both users were reserved (or they are guests/no DB user)
     if (initiatorUser) initiatorUser = ensureAvatarAbs(initiatorUser);
     if (acceptorUser) acceptorUser = ensureAvatarAbs(acceptorUser);
 
@@ -716,6 +816,24 @@ async function enqueueMatch({
         userA: { id: userId, username: username || "Guest" },
         userB: { id: opp.userId, username: opp.username || "Guest" },
       });
+
+      if (!roomRes || !roomRes.roomId) {
+        // failed to create room (likely because one player already in activeRoom)
+        try {
+          if (io) {
+            io.to(socketId).emit("match-found-failed", {
+              ok: false,
+              error: "create-room-failed",
+            });
+            io.to(opp.socketId).emit("match-found-failed", {
+              ok: false,
+              error: "create-room-failed",
+            });
+          }
+        } catch (e) {}
+        matchmaking.socketIndex.delete(socketId);
+        return { ok: false, error: "create-room-failed" };
+      }
 
       const roomId =
         (roomRes && (roomRes.roomId || roomRes.id)) || generateRoomCode();

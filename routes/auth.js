@@ -1,3 +1,4 @@
+// backend/src/routes/auth.js
 const express = require("express");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
@@ -11,11 +12,7 @@ const {
   isLoopbackOrLocal,
 } = require("../helpers/geo");
 
-/**
- * Cookie helper for consistent cross-site behavior
- * - When running under HTTPS / production we set SameSite=None and Secure=true so browsers accept cross-site cookies.
- * - For local dev (http) we keep SameSite=lax and secure=false so cookies work on localhost.
- */
+/* Cookie helper (same as before) */
 function makeCookieOptions(req) {
   const forwardedProto = (req.headers["x-forwarded-proto"] || "")
     .split(",")[0]
@@ -31,18 +28,9 @@ function makeCookieOptions(req) {
     secure: !!isSecure,
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     path: "/",
-    // domain: process.env.COOKIE_DOMAIN || undefined, // uncomment if you need a specific domain
   };
 }
 
-/**
- * tryRequire(pathsArray)
- * Try multiple require() paths and return the first successful module.
- * If none found, rethrow the MODULE_NOT_FOUND error (or throw a clear error).
- *
- * NOTE: In this file we already require ../models/User above, so tryRequire usage from
- * the prior version is not strictly needed here. Kept helper out of other modules.
- */
 function tryRequire(paths) {
   let lastErr = null;
   for (const p of paths) {
@@ -202,6 +190,7 @@ router.post("/register", async (req, res) => {
     const cookieOptions = makeCookieOptions(req);
     res.cookie("token", token, cookieOptions);
 
+    // include activeRoom in response so client knows server-side guard
     res.json({
       token,
       user: {
@@ -216,6 +205,7 @@ router.post("/register", async (req, res) => {
         cups: user.cups,
         lastIp: user.lastIp || null,
         dob: user.dob ? user.dob.toISOString() : null,
+        activeRoom: user.activeRoom || null, // NEW
       },
       country: geo.country,
       flagUrl: geo.flagUrl,
@@ -259,6 +249,7 @@ router.post("/login", async (req, res) => {
         cups: user.cups,
         lastIp: user.lastIp || null,
         dob: user.dob ? user.dob.toISOString() : null,
+        activeRoom: user.activeRoom || null, // NEW
       },
     });
   } catch (err) {
@@ -317,6 +308,7 @@ router.get("/me", authMiddleware, async (req, res) => {
       lastIp: u.lastIp || null,
       flagUrl,
       dob: u.dob ? u.dob.toISOString() : null,
+      activeRoom: u.activeRoom || null, // NEW
     });
   } catch (err) {
     console.error("/me error", err);
@@ -355,6 +347,7 @@ router.put("/profile", authMiddleware, async (req, res) => {
       cups: u.cups,
       lastIp: u.lastIp || null,
       dob: u.dob ? u.dob.toISOString() : null,
+      activeRoom: u.activeRoom || null, // NEW
     });
   } catch (err) {
     console.error("/profile PUT error", err);
