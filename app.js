@@ -21,6 +21,28 @@ const {
   updateUserIpIfChangedFromReq,
 } = require("./middleware/auth");
 
+let ImageKit = null;
+let imagekitClient = null;
+// initialize ImageKit client if env vars present
+if (
+  process.env.IMAGEKIT_PUBLIC_KEY &&
+  process.env.IMAGEKIT_PRIVATE_KEY &&
+  process.env.IMAGEKIT_URL_ENDPOINT
+) {
+  try {
+    ImageKit = require("imagekit");
+    imagekitClient = new ImageKit({
+      publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+      privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+      urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT,
+    });
+    console.log("ImageKit initialized.");
+  } catch (err) {
+    console.error("Failed to initialize ImageKit:", err);
+    imagekitClient = null;
+  }
+}
+
 const app = express();
 
 // --- START: improved origins parsing (supports comma-separated values, filters empties) ---
@@ -193,8 +215,57 @@ app.post(
       if (!req.file) return res.status(400).json({ error: "No file uploaded" });
       const u = await User.findById(req.user.id);
       if (!u) return res.status(404).json({ error: "User not found" });
-      // store relative URL
-      const rel = `/uploads/${req.file.filename}`;
+
+      // If ImageKit is configured, upload there first
+      if (imagekitClient) {
+        try {
+          const safeName = (req.file.originalname || "avatar")
+            .replace(/\s+/g, "_")
+            .replace(/[^a-zA-Z0-9_.-]/g, "");
+          const fileName = `${Date.now()}_${safeName}`;
+
+          // convert buffer to base64 string for imagekit
+          const base64 = req.file.buffer.toString("base64");
+
+          // optional: put avatars inside a folder
+          const folder =
+            process.env.IMAGEKIT_AVATAR_FOLDER || "/Chess-app-avaters";
+
+          const uploadResult = await imagekitClient.upload({
+            file: base64,
+            fileName,
+            folder,
+          });
+
+          // store absolute URL returned by ImageKit (this keeps absoluteAvatarUrl behavior consistent)
+          u.avatarUrl = uploadResult.url; // absolute URL
+          await u.save();
+
+          res.json({
+            avatarUrl: u.avatarUrl,
+            avatarUrlAbsolute: u.avatarUrl,
+          });
+          return;
+        } catch (ikErr) {
+          console.error(
+            "ImageKit upload failed, falling back to local save:",
+            ikErr
+          );
+          // continue to fallback local save below
+        }
+      }
+
+      // FALLBACK: Save to local disk (keeps previous behavior)
+      const safe = (req.file.originalname || "avatar")
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_.-]/g, "");
+      const filename = `${Date.now()}_${safe}`;
+      const outPath = path.join(UPLOADS_DIR, filename);
+
+      // write buffer to disk
+      fs.writeFileSync(outPath, req.file.buffer);
+
+      const rel = `/uploads/${filename}`;
       u.avatarUrl = rel;
       await u.save();
 
