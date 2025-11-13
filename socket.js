@@ -3262,6 +3262,28 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       }
     }
 
+    socket.on("webrtc-offer", ({ roomId, toSocketId, offer }) => {
+      try {
+        const payload = { fromSocketId: socket.id, offer };
+
+        if (toSocketId) {
+          relayToSocketOrUser(toSocketId, "webrtc-offer", payload);
+          return;
+        }
+
+        if (roomId && rooms[roomId]) {
+          const opponent = (rooms[roomId].players || []).find(
+            (p) => p.id !== socket.id && (p.color === "w" || p.color === "b")
+          );
+          if (opponent && opponent.id) {
+            relayToSocketOrUser(opponent.id, "webrtc-offer", payload);
+          }
+        }
+      } catch (e) {
+        console.error("webrtc-offer relay error:", e);
+      }
+    });
+
     socket.on("webrtc-answer", ({ roomId, toSocketId, answer }) => {
       try {
         const payload = { fromSocketId: socket.id, answer };

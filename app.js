@@ -284,25 +284,3 @@ app.post(
 );
 
 module.exports = app;
-
-// socket.on("webrtc-offer", ({ roomId, toSocketId, offer }) => {
-//   try {
-//     const payload = { fromSocketId: socket.id, offer };
-
-//     if (toSocketId) {
-//       relayToSocketOrUser(toSocketId, "webrtc-offer", payload);
-//       return;
-//     }
-
-//     if (roomId && rooms[roomId]) {
-//       const opponent = (rooms[roomId].players || []).find(
-//         (p) => p.id !== socket.id && (p.color === "w" || p.color === "b")
-//       );
-//       if (opponent && opponent.id) {
-//         relayToSocketOrUser(opponent.id, "webrtc-offer", payload);
-//       }
-//     }
-//   } catch (e) {
-//     console.error("webrtc-offer relay error:", e);
-//   }
-// });
