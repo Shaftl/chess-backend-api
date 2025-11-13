@@ -38,13 +38,11 @@ const UserSchema = new mongoose.Schema({
   lastIp: { type: String, default: null },
 
   // NEW: persistent single-active-room guard
-  activeRoom: { type: String, default: null },
 
   // NEW: user's current session id (string). Used to invalidate old JWTs when user logs in again.
   currentSession: { type: String, default: null },
 
   // NEW: simple status: 'idle' | 'playing' | other states you may add later
-  status: { type: String, default: "idle" },
 
   createdAt: { type: Date, default: Date.now },
 });
