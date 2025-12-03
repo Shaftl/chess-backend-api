@@ -1,7 +1,8 @@
-// roomManager.js (final, fixed)
+// roomManager.js (final, fixed - with finishRoom centralization)
 // - robust activeRoom clearing
 // - room expiration for abandoned rooms
 // - createRematchFrom to create a new room for play-again/rematch (avoids reusing old id)
+// - NEW: finishRoom(roomId, finishedObj) centralizes finalization and calls saveFinishedGame
 
 const { Chess } = require("chess.js");
 const Game = require("./models/Game");
@@ -38,7 +39,6 @@ function generateRoomCode(len = 6) {
 /**
  * assignColorsForRematch(room)
  * Keeps compatibility but doesn't change global behavior that depends on it.
- * (Rematch flow that creates a new room should call createRematchFrom instead.)
  */
 function assignColorsForRematch(room) {
   if (!room || !room.players) return;
@@ -102,8 +102,96 @@ async function _clearActiveRoomSafety(roomId, participantIds = []) {
 }
 
 /**
+ * finishRoom(roomId, finishedObj)
+ * Centralized end-of-game handler:
+ * - idempotent (won't run twice)
+ * - sets room.finished, emits game-over, persists snapshot via broadcastRoomState
+ * - clears activeRoom on participants and calls saveFinishedGame to persist game + update cups
+ */
+async function finishRoom(roomId, finishedObj) {
+  try {
+    const room = rooms[roomId];
+    if (!room) {
+      // if no in-memory room exist, still attempt to persist finished to DB with RoomModel
+      // but since saveFinishedGame relies on in-memory room shape, we bail here.
+      return;
+    }
+
+    // Avoid double-finalization
+    if (room.finished && room.finished._finalized) return;
+    // stamp finished (keep given fields and add finishedAt)
+    room.finished = {
+      ...(finishedObj || {}),
+      finishedAt:
+        finishedObj && finishedObj.finishedAt
+          ? finishedObj.finishedAt
+          : Date.now(),
+    };
+    // mark finalized to prevent double-run
+    room.finished._finalized = true;
+    room.paused = true;
+
+    // Emit game-over to clients
+    try {
+      io.to(roomId).emit("game-over", { ...room.finished });
+    } catch (e) {}
+
+    // Broadcast updated room state (room-update contains finished)
+    broadcastRoomState(roomId);
+
+    // Clear timers
+    try {
+      clearFirstMoveTimer(room);
+      clearRoomExpiration(roomId);
+    } catch (e) {}
+
+    // Clear activeRoom entries for players (best-effort)
+    try {
+      const participantIds = (room.players || [])
+        .map((p) => {
+          if (!p) return null;
+          const uid =
+            (p.user && (p.user.id || p.user._id)) ||
+            p.id ||
+            (p.user && p.user._id) ||
+            null;
+          return uid ? String(uid) : null;
+        })
+        .filter(Boolean);
+
+      if (participantIds.length > 0) {
+        await User.updateMany(
+          { _id: { $in: participantIds } },
+          { $set: { activeRoom: null, status: "idle" } }
+        ).exec();
+      }
+
+      // Safety: also clear any user still referencing this roomId as activeRoom
+      await User.updateMany(
+        { activeRoom: String(roomId) },
+        { $set: { activeRoom: null, status: "idle" } }
+      ).exec();
+    } catch (e) {
+      console.error("finishRoom: clearing activeRoom failed", e);
+    }
+
+    // Persist finished game and run cups/rating update
+    try {
+      await saveFinishedGame(roomId);
+    } catch (e) {
+      console.error("finishRoom: saveFinishedGame error", e);
+    }
+  } catch (err) {
+    console.error("finishRoom error:", err);
+  }
+}
+
+/**
  * saveFinishedGame(roomId)
  * Persist finished game and do rating updates, then clear DB activeRoom for participants.
+ *
+ * NOTE: This function has been hardened to correctly resolve winner/loser users
+ * and to handle cups === 0 (nullish coalescing).
  */
 async function saveFinishedGame(roomId) {
   try {
@@ -141,14 +229,23 @@ async function saveFinishedGame(roomId) {
     if (!room || !room.finished) return;
     const finished = room.finished || {};
 
+    // helper: detect objectid-like string
+    const looksLikeObjectId = (v) =>
+      !!(v && typeof v === "string" && /^[a-fA-F0-9]{24}$/.test(v));
+
+    // More robust player -> user id resolution
     function playerUserId(p) {
       if (!p) return null;
-      const uid =
-        (p.user && (p.user.id || p.user._id)) ||
-        p.id ||
-        (p.user && p.user._id) ||
-        null;
-      return uid ? String(uid) : null;
+      // prefer nested user id / _id
+      if (p.user) {
+        if (p.user.id) return String(p.user.id);
+        if (p.user._id) return String(p.user._id);
+      }
+      // fallback to top-level id if it's an ObjectId-like string
+      if (p.id && typeof p.id === "string" && looksLikeObjectId(p.id))
+        return String(p.id);
+      // otherwise no reliable DB id
+      return null;
     }
 
     let winnerId = null;
@@ -168,6 +265,21 @@ async function saveFinishedGame(roomId) {
       if (w === "w" || w === "b") {
         const p = (room.players || []).find((x) => x.color === w);
         winnerId = playerUserId(p);
+      } else {
+        // finished.winner may be a username; attempt to find player by username
+        const p = (room.players || []).find((pp) => {
+          const uname =
+            (pp.user && (pp.user.username || pp.user.displayName)) ||
+            pp.username;
+          return (
+            uname &&
+            String(uname).toLowerCase() ===
+              String(finished.winner).toLowerCase()
+          );
+        });
+        if (p)
+          winnerId =
+            playerUserId(p) || (p.user && (p.user.id || p.user._id)) || null;
       }
     }
 
@@ -184,30 +296,110 @@ async function saveFinishedGame(roomId) {
       if (finished.loserId || finished.loser) {
         const lid = finished.loserId || finished.loser;
         const loserCandidate = (room.players || []).find((p) => {
-          const uid = playerUserId(p);
+          const uid =
+            (p.user && (p.user.id || p.user._id)) ||
+            p.id ||
+            (p.user && p.user._id) ||
+            null;
           const uname =
             (p.user && (p.user.username || p.user.displayName)) || p.username;
           return uid === String(lid) || String(uname) === String(lid);
         });
         if (loserCandidate) {
-          loserId = playerUserId(loserCandidate);
+          loserId =
+            (loserCandidate.user &&
+              (loserCandidate.user.id || loserCandidate.user._id)) ||
+            loserCandidate.id ||
+            null;
           const winnerCandidate = (room.players || []).find((p) => {
-            const uid = playerUserId(p);
+            const uid = (p.user && (p.user.id || p.user._id)) || p.id || null;
             return uid && String(uid) !== String(loserId);
           });
-          winnerId = playerUserId(winnerCandidate);
+          winnerId =
+            (winnerCandidate &&
+              ((winnerCandidate.user &&
+                (winnerCandidate.user.id || winnerCandidate.user._id)) ||
+                winnerCandidate.id)) ||
+            null;
         }
       }
     }
 
-    const winnerUser = winnerId
-      ? await User.findById(String(winnerId)).select("cups").exec()
-      : null;
-    const loserUser = loserId
-      ? await User.findById(String(loserId)).select("cups").exec()
-      : null;
-    const winnerRating = Number(winnerUser?.cups || 1200);
-    const loserRating = Number(loserUser?.cups || 1200);
+    // At this point winnerId/loserId may be a DB _id-string or may be null.
+    // Try to load the users robustly: if we have an ObjectId-like string, use findById,
+    // otherwise try a username lookup (in case id was passed as username).
+    let winnerUser = null;
+    let loserUser = null;
+
+    if (winnerId) {
+      if (looksLikeObjectId(winnerId)) {
+        winnerUser = await User.findById(String(winnerId))
+          .select("cups")
+          .exec();
+      } else {
+        // try lookup by username/displayName
+        winnerUser = await User.findOne({
+          $or: [{ username: winnerId }, { displayName: winnerId }],
+        })
+          .select("cups")
+          .exec();
+      }
+    }
+
+    if (loserId) {
+      if (looksLikeObjectId(loserId)) {
+        loserUser = await User.findById(String(loserId)).select("cups").exec();
+      } else {
+        loserUser = await User.findOne({
+          $or: [{ username: loserId }, { displayName: loserId }],
+        })
+          .select("cups")
+          .exec();
+      }
+    }
+
+    // As a last-ditch: if winnerUser/loserUser still null, try to derive them from room.players by matching username
+    if (!winnerUser) {
+      const p = (room.players || []).find((pp) => {
+        const uname =
+          (pp.user && (pp.user.username || pp.user.displayName)) || pp.username;
+        return (
+          uname &&
+          String(uname).toLowerCase() ===
+            String(finished.winner || "").toLowerCase()
+        );
+      });
+      if (p && p.user && (p.user.id || p.user._id)) {
+        try {
+          winnerUser = await User.findById(String(p.user.id || p.user._id))
+            .select("cups")
+            .exec();
+        } catch (e) {}
+      }
+    }
+
+    if (!loserUser) {
+      const p = (room.players || []).find((pp) => {
+        const uname =
+          (pp.user && (pp.user.username || pp.user.displayName)) || pp.username;
+        return (
+          uname &&
+          String(uname).toLowerCase() ===
+            String(finished.loser || "").toLowerCase()
+        );
+      });
+      if (p && p.user && (p.user.id || p.user._id)) {
+        try {
+          loserUser = await User.findById(String(p.user.id || p.user._id))
+            .select("cups")
+            .exec();
+        } catch (e) {}
+      }
+    }
+
+    // Use nullish coalescing so that cups === 0 is treated as a valid rating (not replaced by 1200)
+    const winnerRating = Number(winnerUser?.cups ?? 1200);
+    const loserRating = Number(loserUser?.cups ?? 1200);
 
     const movesRaw = Array.isArray(room.moves) ? room.moves : [];
     const toUci = (m) => {
@@ -234,7 +426,11 @@ async function saveFinishedGame(roomId) {
 
     let winnerColor = null;
     const pWinner = (room.players || []).find((p) => {
-      const uid = playerUserId(p);
+      const uid =
+        (p.user && (p.user.id || p.user._id)) ||
+        p.id ||
+        (p.user && p.user._id) ||
+        null;
       return uid && String(uid) === String(winnerId);
     });
     if (pWinner && pWinner.color) winnerColor = String(pWinner.color);
@@ -297,48 +493,15 @@ async function saveFinishedGame(roomId) {
     if (winnerUser && loserUser) {
       const newWinner = Math.max(
         0,
-        Number(winnerUser.cups || 0) + Number(delta)
+        Number(winnerUser.cups ?? 0) + Number(delta)
       );
       await adjustUserCupsAndNotify(winnerUser._id, newWinner, delta);
 
-      const newLoser = Math.max(0, Number(loserUser.cups || 0) - Number(delta));
+      const newLoser = Math.max(0, Number(loserUser.cups ?? 0) - Number(delta));
       await adjustUserCupsAndNotify(loserUser._id, newLoser, -delta);
     }
 
-    // --- Clear activeRoom and set status idle for participants (best-effort)
-    try {
-      const participantIds = (room.players || [])
-        .map((p) => {
-          if (!p) return null;
-          const uid =
-            (p.user && (p.user.id || p.user._id)) ||
-            p.id ||
-            (p.user && p.user._id) ||
-            null;
-          return uid ? String(uid) : null;
-        })
-        .filter(Boolean);
-
-      if (participantIds.length > 0) {
-        await User.updateMany(
-          { _id: { $in: participantIds } },
-          { $set: { activeRoom: null, status: "idle" } }
-        ).exec();
-        for (const uid of participantIds) {
-          try {
-            notifyUser(String(uid), "active-room-cleared", { roomId });
-          } catch (e) {}
-        }
-      }
-
-      // Safety: also clear any user still referencing this roomId as activeRoom
-      await User.updateMany(
-        { activeRoom: String(roomId) },
-        { $set: { activeRoom: null, status: "idle" } }
-      ).exec();
-    } catch (e) {
-      // non-fatal
-    }
+    // no further active-room clearing here; finishRoom already attempted it
   } catch (err) {
     console.error("cups update error after saving game:", err);
   }
@@ -347,6 +510,7 @@ async function saveFinishedGame(roomId) {
 /**
  * scheduleFirstMoveTimer(roomId)
  * If first move not made, mark game drawn after FIRST_MOVE_TIMEOUT_MS.
+ * Now uses finishRoom(...) instead of directly setting room.finished.
  */
 function scheduleFirstMoveTimer(roomId) {
   const room = rooms[roomId];
@@ -356,25 +520,21 @@ function scheduleFirstMoveTimer(roomId) {
   const turn = room.chess ? room.chess.turn() : null;
   if (!turn) return;
   room.firstMoveTimer = setTimeout(async () => {
-    if (room.lastIndex === -1 && !room.paused && !room.finished) {
-      room.paused = true;
-      room.finished = {
-        reason: "first-move-timeout",
-        result: "draw",
-        message: `No first move within ${
-          FIRST_MOVE_TIMEOUT_MS / 1000
-        }s — game drawn`,
-        finishedAt: Date.now(),
-      };
-      io.to(roomId).emit("game-over", { ...room.finished });
-      broadcastRoomState(roomId);
-      try {
-        // clear activeRoom entries (robust)
-        await _clearActiveRoomSafety(roomId);
-      } catch (e) {}
-      await saveFinishedGame(roomId);
+    try {
+      if (room.lastIndex === -1 && !room.paused && !room.finished) {
+        await finishRoom(roomId, {
+          reason: "first-move-timeout",
+          result: "draw",
+          message: `No first move within ${
+            FIRST_MOVE_TIMEOUT_MS / 1000
+          }s — game drawn`,
+        });
+      }
+    } catch (e) {
+      console.error("first-move timer finish error", e);
+    } finally {
+      if (room) room.firstMoveTimer = null;
     }
-    room.firstMoveTimer = null;
   }, FIRST_MOVE_TIMEOUT_MS);
 }
 
@@ -410,32 +570,14 @@ function scheduleRoomExpiration(roomId) {
         const activeCount = coloredPlayers.filter((p) => !!p.online).length;
 
         if (!r.finished && (r.lastIndex === -1 || activeCount < 2)) {
-          r.paused = true;
-          r.finished = {
+          await finishRoom(roomId, {
             reason: "abandoned",
             result: "abandoned",
             message: "Room expired (no opponent joined in time)",
-            finishedAt: Date.now(),
-          };
-
-          io.to(roomId).emit("game-over", { ...r.finished });
-          clearFirstMoveTimer(r);
-          broadcastRoomState(roomId);
-
-          // robust clear activeRoom
-          try {
-            await _clearActiveRoomSafety(roomId);
-          } catch (e) {
-            console.error(
-              "scheduleRoomExpiration: clear active room failed",
-              e
-            );
-          }
-
-          await saveFinishedGame(roomId);
+          });
         }
       } catch (e) {
-        console.error("scheduleRoomExpiration handler error", e);
+        console.error("scheduleRoomExpiration: handler error", e);
       } finally {
         clearRoomExpiration(roomId);
       }
@@ -1297,8 +1439,9 @@ module.exports = {
   getSocketsForUserId,
   notifyUser,
   createRoom,
-  // rematch helper to create a NEW room (do not reuse old id)
   createRematchFrom,
+  // NEW export:
+  finishRoom,
   // matchmaking:
   enqueueMatch,
   dequeueBySocketId,

@@ -671,7 +671,7 @@ async function attemptMatchmaking() {
                   room.players[1];
                 if (p) s2.emit("player-assigned", { color: p.color });
               }
-              ioServer.to(createdRoomId).emit("room-update", {
+              io.to(createdRoomId).emit("room-update", {
                 players: room.players.map(mapPlayerForEmit),
                 moves: room.moves,
                 fen: room.chess ? room.chess.fen() : room.fen,
@@ -729,6 +729,321 @@ async function attemptMatchmaking() {
 /* ------------------------------------------------------------------ */
 
 let ioServer = null;
+
+/* -------------------------
+   NEW HELPER: apply cups
+   - idempotent via Game.cupsProcessed
+   - uses ratingUtils.computeDeltaForWinner when available
+   ------------------------- */
+
+let ratingUtils = null;
+try {
+  ratingUtils = require("./ratingUtils");
+} catch (e) {
+  ratingUtils = null;
+}
+
+/* -----------------------------------------------------------------------
+   Robust, idempotent cup application helper.
+   - Matches saved Game records when you save `roomId` as "<roomId>-<ts>".
+   - Skips draws and marks games as cupsProcessed to avoid re-processing.
+   - Attempts multiple lookup strategies (roomId-prefix, room, meta.roomId, _id prefix).
+   ----------------------------------------------------------------------- */
+async function applyCupsForFinishedRoom(roomId) {
+  try {
+    if (!roomId) return;
+
+    // small helper to escape regex
+    const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    let gameDoc = null;
+
+    // 1) Try: roomId field starts with roomId (covers your saved pattern roomId-timestamp)
+    try {
+      const re = new RegExp("^" + esc(roomId) + "(?:-|$)");
+      gameDoc = await Game.findOne({ roomId: { $regex: re } })
+        .sort({ createdAt: -1 })
+        .exec();
+      if (gameDoc) {
+        console.log(
+          "[applyCups] found Game by roomId prefix:",
+          gameDoc._id?.toString(),
+          "roomIdField:",
+          gameDoc.roomId
+        );
+      }
+    } catch (e) {
+      console.error("[applyCups] lookup by roomId prefix failed:", e);
+    }
+
+    // 2) Try other likely fields: room, meta.roomId
+    if (!gameDoc) {
+      try {
+        gameDoc = await Game.findOne({ room: roomId })
+          .sort({ createdAt: -1 })
+          .exec();
+        if (gameDoc)
+          console.log(
+            "[applyCups] found Game by field 'room':",
+            gameDoc._id?.toString()
+          );
+      } catch (e) {}
+    }
+    if (!gameDoc) {
+      try {
+        gameDoc = await Game.findOne({ "meta.roomId": roomId })
+          .sort({ createdAt: -1 })
+          .exec();
+        if (gameDoc)
+          console.log(
+            "[applyCups] found Game by field 'meta.roomId':",
+            gameDoc._id?.toString()
+          );
+      } catch (e) {}
+    }
+
+    // 3) Try _id prefix (your logs show saved _id often beginning with roomId-)
+    if (!gameDoc) {
+      try {
+        const reId = new RegExp("^" + esc(roomId) + "-");
+        gameDoc = await Game.findOne({ _id: { $regex: reId } })
+          .sort({ createdAt: -1 })
+          .exec();
+        if (gameDoc)
+          console.log(
+            "[applyCups] found Game by _id prefix:",
+            gameDoc._id?.toString()
+          );
+      } catch (e) {
+        console.error("[applyCups] lookup by _id prefix failed:", e);
+      }
+    }
+
+    // 4) Fallback: take most recent Game (best-effort)
+    if (!gameDoc) {
+      try {
+        gameDoc = await Game.findOne({})
+          .sort({ createdAt: -1 })
+          .limit(1)
+          .exec();
+        if (gameDoc)
+          console.log(
+            "[applyCups] fallback: picked most recent Game:",
+            gameDoc._id?.toString()
+          );
+      } catch (e) {}
+    }
+
+    if (!gameDoc) {
+      console.warn("[applyCups] no Game found for roomId:", roomId);
+      return;
+    }
+
+    // If we've already applied cups for this game, don't repeat
+    if (gameDoc.cupsProcessed) {
+      console.log(
+        "[applyCups] game already processed for cups:",
+        gameDoc._id?.toString()
+      );
+      return;
+    }
+
+    const finished = gameDoc.finished || {};
+    const result = finished.result || null;
+    const reason = (finished.reason || "").toLowerCase();
+
+    // If draw-ish -> mark processed and skip cups
+    if (
+      result === "draw" ||
+      reason.includes("draw") ||
+      reason.includes("stalemate") ||
+      reason.includes("threefold") ||
+      reason.includes("insufficient")
+    ) {
+      try {
+        await Game.updateOne(
+          { _id: gameDoc._id },
+          { $set: { cupsProcessed: true } }
+        ).exec();
+      } catch (e) {
+        console.error("[applyCups] mark cupsProcessed (draw) failed:", e);
+      }
+      console.log(
+        "[applyCups] draw/stalemate/insufficient — skipping cups for game:",
+        gameDoc._id?.toString()
+      );
+      return;
+    }
+
+    // Determine winnerColor or winner id/username
+    let winnerColor = finished.winner || null; // often 'w' or 'b'
+    // Prepare players array
+    const players = Array.isArray(gameDoc.players) ? gameDoc.players : [];
+
+    // Resolve winner/loser entries from players
+    let winnerEntry = null;
+    let loserEntry = null;
+
+    // If winnerColor looks like 'w' or 'b', match by color first
+    if (winnerColor === "w" || winnerColor === "b") {
+      winnerEntry = players.find(
+        (p) => String(p.color) === String(winnerColor)
+      );
+      loserEntry = players.find(
+        (p) => (p.color === "w" || p.color === "b") && p.color !== winnerColor
+      );
+    } else if (finished.winnerId || finished.loserId) {
+      // prefer explicit winnerId/loserId if present on finished payload
+      const wid = finished.winnerId || finished.winner;
+      const lid = finished.loserId || finished.loser;
+      winnerEntry = players.find(
+        (p) => String(p.user?.id || p.user?._id || p.id) === String(wid)
+      );
+      loserEntry = players.find(
+        (p) => String(p.user?.id || p.user?._id || p.id) === String(lid)
+      );
+    } else {
+      // Attempt to match winner by username/displayName if finished.winner is a username
+      if (winnerColor) {
+        const lower = String(winnerColor).toLowerCase();
+        winnerEntry =
+          players.find(
+            (p) =>
+              (p.user &&
+                ((p.user.username &&
+                  String(p.user.username).toLowerCase() === lower) ||
+                  (p.user.displayName &&
+                    String(p.user.displayName).toLowerCase() === lower))) ||
+              (p.username && String(p.username).toLowerCase() === lower)
+          ) || null;
+      }
+      if (!winnerEntry && players.length === 2) {
+        // last resort: assume one is winner (if finished.reason suggests a win)
+        winnerEntry = players[0];
+        loserEntry = players[1];
+      } else if (winnerEntry && !loserEntry) {
+        loserEntry = players.find((p) => p !== winnerEntry) || null;
+      }
+    }
+
+    // If still not resolved but we have exactly two players, assign by index heuristics
+    if (!winnerEntry && players.length === 2) {
+      winnerEntry = players[0];
+      loserEntry = players[1];
+    }
+    if (!loserEntry && players.length === 2) {
+      loserEntry = players.find((p) => p !== winnerEntry) || players[1] || null;
+    }
+
+    const winnerUserId =
+      winnerEntry?.user?.id ||
+      winnerEntry?.user?._id ||
+      winnerEntry?.id ||
+      null;
+    const loserUserId =
+      loserEntry?.user?.id || loserEntry?.user?._id || loserEntry?.id || null;
+
+    if (!winnerUserId || !loserUserId) {
+      try {
+        await Game.updateOne(
+          { _id: gameDoc._id },
+          { $set: { cupsProcessed: true } }
+        ).exec();
+      } catch (e) {}
+      console.warn(
+        "[applyCups] missing player user ids; marked processed. game:",
+        gameDoc._id?.toString()
+      );
+      return;
+    }
+
+    // Load the two users from DB (best-effort)
+    const users = await User.find({
+      _id: { $in: [winnerUserId, loserUserId].map(String) },
+    }).exec();
+    const winnerUser = users.find(
+      (u) => String(u._id) === String(winnerUserId)
+    );
+    const loserUser = users.find((u) => String(u._id) === String(loserUserId));
+
+    if (!winnerUser || !loserUser) {
+      try {
+        await Game.updateOne(
+          { _id: gameDoc._id },
+          { $set: { cupsProcessed: true } }
+        ).exec();
+      } catch (e) {}
+      console.warn(
+        "[applyCups] could not load user docs; marked processed. game:",
+        gameDoc._id?.toString()
+      );
+      return;
+    }
+
+    const winnerCups =
+      typeof winnerUser.cups === "number" ? winnerUser.cups : 0;
+    const loserCups = typeof loserUser.cups === "number" ? loserUser.cups : 0;
+
+    // compute delta (try ratingUtils.computeDeltaForWinner if available)
+    let delta = 10;
+    try {
+      if (
+        typeof ratingUtils !== "undefined" &&
+        ratingUtils &&
+        typeof ratingUtils.computeDeltaForWinner === "function"
+      ) {
+        const maybe = ratingUtils.computeDeltaForWinner(winnerCups, loserCups);
+        const n = Number(maybe);
+        if (Number.isFinite(n)) delta = Math.max(1, Math.floor(n));
+      }
+    } catch (e) {
+      console.warn(
+        "[applyCups] ratingUtils.computeDeltaForWinner failed, falling back to delta=10",
+        e
+      );
+      delta = 10;
+    }
+
+    const winnerNew = winnerCups + delta;
+    const loserNew = Math.max(0, loserCups - delta);
+
+    try {
+      await User.updateOne(
+        { _id: winnerUser._id },
+        { $set: { cups: winnerNew } }
+      ).exec();
+      await User.updateOne(
+        { _id: loserUser._id },
+        { $set: { cups: loserNew } }
+      ).exec();
+    } catch (e) {
+      console.error("[applyCups] failed to update user cups:", e);
+    }
+
+    try {
+      await Game.updateOne(
+        { _id: gameDoc._id },
+        { $set: { cupsProcessed: true, cupsDelta: delta } }
+      ).exec();
+    } catch (e) {
+      console.error("[applyCups] failed to mark game cupsProcessed:", e);
+    }
+
+    console.log(
+      `[applyCups] applied delta=${delta} — winner ${
+        winnerUser._id
+      } (${winnerCups}->${winnerNew}), loser ${
+        loserUser._id
+      } (${loserCups}->${loserNew}) for game ${gameDoc._id?.toString()}`
+    );
+  } catch (err) {
+    console.error("applyCupsForFinishedRoom error", err);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* rest of socket init and handlers (kept from your code)             */
+/* ------------------------------------------------------------------ */
 
 function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
   const io = new Server(server, {
@@ -794,7 +1109,20 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           clearDisconnectTimer(room, sid)
         );
         broadcastRoomState(roomId);
-        saveFinishedGame(roomId).catch(() => {});
+
+        // save finished game and then apply cups
+        (async () => {
+          try {
+            await saveFinishedGame(roomId);
+          } catch (err) {
+            console.error("saveFinishedGame error (timeout):", err);
+          }
+          try {
+            await applyCupsForFinishedRoom(roomId);
+          } catch (e) {
+            console.error("applyCupsForFinishedRoom error (timeout):", e);
+          }
+        })();
       }
     });
   }, 500);
@@ -1586,7 +1914,12 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           try {
             await saveFinishedGame(roomId);
           } catch (err) {
-            console.error("saveFinishedGame error:", err);
+            console.error("saveFinishedGame error (make-move):", err);
+          }
+          try {
+            await applyCupsForFinishedRoom(roomId);
+          } catch (e) {
+            console.error("applyCupsForFinishedRoom error (make-move):", e);
           }
         } else {
           broadcastRoomState(roomId);
@@ -1635,7 +1968,16 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
             console.error("clearActiveRoomForRoom after resign failed", e);
           }
 
-          await saveFinishedGame(roomId);
+          try {
+            await saveFinishedGame(roomId);
+          } catch (err) {
+            console.error("saveFinishedGame error (resign):", err);
+          }
+          try {
+            await applyCupsForFinishedRoom(roomId);
+          } catch (e) {
+            console.error("applyCupsForFinishedRoom error (resign):", e);
+          }
         }
 
         room.players = room.players.filter((p) => p.id !== socket.id);
@@ -1723,7 +2065,16 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         clearDisconnectTimer(room, sid)
       );
       broadcastRoomState(roomId);
-      await saveFinishedGame(roomId);
+      try {
+        await saveFinishedGame(roomId);
+      } catch (err) {
+        console.error("saveFinishedGame error (accept-draw):", err);
+      }
+      try {
+        await applyCupsForFinishedRoom(roomId);
+      } catch (e) {
+        console.error("applyCupsForFinishedRoom error (accept-draw):", e);
+      }
 
       // Notify both parties that draw was accepted (persisted notifications)
       try {
@@ -1896,7 +2247,16 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           clearDisconnectTimer(room, sid)
         );
         broadcastRoomState(roomId);
-        await saveFinishedGame(roomId);
+        try {
+          await saveFinishedGame(roomId);
+        } catch (err) {
+          console.error("saveFinishedGame error (player-timeout):", err);
+        }
+        try {
+          await applyCupsForFinishedRoom(roomId);
+        } catch (e) {
+          console.error("applyCupsForFinishedRoom error (player-timeout):", e);
+        }
       }
     });
 
@@ -2051,7 +2411,16 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           clearDisconnectTimer(room, sid)
         );
         broadcastRoomState(roomId);
-        await saveFinishedGame(roomId);
+        try {
+          await saveFinishedGame(roomId);
+        } catch (err) {
+          console.error("saveFinishedGame error (leave-room):", err);
+        }
+        try {
+          await applyCupsForFinishedRoom(roomId);
+        } catch (e) {
+          console.error("applyCupsForFinishedRoom error (leave-room):", e);
+        }
       }
 
       // remove the player socket entry
@@ -3456,7 +3825,22 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
                   );
                 }
 
-                await saveFinishedGame(rId);
+                try {
+                  await saveFinishedGame(rId);
+                } catch (err) {
+                  console.error(
+                    "saveFinishedGame error (disconnect timer):",
+                    err
+                  );
+                }
+                try {
+                  await applyCupsForFinishedRoom(rId);
+                } catch (e) {
+                  console.error(
+                    "applyCupsForFinishedRoom error (disconnect timer):",
+                    e
+                  );
+                }
               } else {
                 // no online opponent — leave offline (no immediate finish)
               }
