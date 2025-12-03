@@ -1,0 +1,1625 @@
+// backend/socket/handlers/gameHandlers.js
+// Game-related handlers (create/join/move/draw/resign/rematch/leave/disconnect, etc.)
+
+module.exports = {
+  registerAll(socket, context) {
+    const {
+      io,
+      rooms,
+      User,
+      Room,
+      Game,
+      Notification,
+      notificationService,
+      broadcastRoomState,
+      clearDisconnectTimer,
+      clearFirstMoveTimer,
+      scheduleFirstMoveTimer,
+      addOnlineSocketForUser,
+      removeOnlineSocketForUser,
+      MAX_CHAT_MESSAGES,
+      DEFAULT_MS,
+      Chess,
+      markUserActiveRoom,
+      clearActiveRoomForRoom,
+      ensureAvatarAbs,
+      mapPlayerForEmit,
+      normalizeAndValidateRoomCode,
+      normalizePromotionChar,
+      applyCupsForFinishedRoom,
+    } = context;
+
+    socket.on("check-room", async ({ roomId }, cb) => {
+      try {
+        let exists = !!rooms[roomId];
+        if (!exists) {
+          try {
+            const doc = await Room.findOne({ roomId }).lean().exec();
+            exists = !!doc;
+          } catch (e) {}
+        }
+        if (typeof cb === "function") cb({ exists });
+      } catch (e) {
+        if (typeof cb === "function") cb({ exists: false });
+      }
+    });
+
+    socket.on(
+      "create-room",
+      ({ roomId: requestedRoomId, minutes, colorPreference, user }) => {
+        try {
+          let minutesNum =
+            typeof minutes === "number"
+              ? Math.max(1, Math.floor(minutes))
+              : Math.floor(DEFAULT_MS / 60000);
+          const minutesMs = minutesNum * 60 * 1000;
+
+          let roomId = null;
+
+          if (requestedRoomId && String(requestedRoomId).trim()) {
+            const val = normalizeAndValidateRoomCode(requestedRoomId);
+            if (!val.ok) {
+              socket.emit("room-created", { ok: false, error: val.error });
+              return;
+            }
+            roomId = val.code;
+            if (rooms[roomId]) {
+              socket.emit("room-created", {
+                ok: false,
+                error: `Room code "${roomId}" is already in use. Choose a different code.`,
+              });
+              return;
+            }
+          } else {
+            roomId = context.generateRoomCode();
+            let attempts = 0;
+            while (rooms[roomId] && attempts < 8) {
+              roomId = context.generateRoomCode();
+              attempts++;
+            }
+            if (rooms[roomId]) {
+              socket.emit("room-created", {
+                ok: false,
+                error: "Unable to generate unique room code, please try again.",
+              });
+              return;
+            }
+          }
+
+          // Create in-memory room
+          rooms[roomId] = {
+            players: [],
+            moves: [],
+            chess: new Chess(),
+            fen: null,
+            lastIndex: -1,
+            clocks: null,
+            paused: false,
+            disconnectTimers: {},
+            firstMoveTimer: null,
+            pendingDrawOffer: null,
+            finished: null,
+            settings: {
+              minutes: minutesNum,
+              minutesMs,
+              creatorId: socket.user?.id || socket.id,
+              colorPreference: colorPreference || "random",
+            },
+            messages: [],
+            rematch: null,
+          };
+
+          const room = rooms[roomId];
+
+          let assignedColor = "spectator";
+          if (socket.user) {
+            const playerObj = {
+              id: socket.id,
+              user: socket.user || user || { username: "guest" },
+              color: "spectator",
+              online: true,
+              disconnectedAt: null,
+            };
+
+            playerObj.user = ensureAvatarAbs(playerObj.user);
+
+            const pref = room.settings.colorPreference;
+            const wTaken = room.players.some((p) => p.color === "w");
+            const bTaken = room.players.some((p) => p.color === "b");
+
+            if (pref === "white" && !wTaken) assignedColor = "w";
+            else if (pref === "black" && !bTaken) assignedColor = "b";
+            else {
+              if (!wTaken) assignedColor = "w";
+              else if (!bTaken) assignedColor = "b";
+              else assignedColor = "spectator";
+            }
+
+            playerObj.color = assignedColor;
+            room.players.push(playerObj);
+            socket.emit("player-assigned", { color: playerObj.color });
+
+            // mark DB user activeRoom if playing seat
+            if (
+              playerObj.user &&
+              (playerObj.color === "w" || playerObj.color === "b")
+            ) {
+              (async () => {
+                try {
+                  await markUserActiveRoom(
+                    playerObj.user.id || playerObj.user._id,
+                    roomId
+                  );
+                } catch (e) {
+                  console.error(
+                    "markUserActiveRoom after create-room failed",
+                    e
+                  );
+                }
+              })();
+            }
+          } else {
+            const playerObj = {
+              id: socket.id,
+              user: user || { username: "guest" },
+              color: "spectator",
+              online: true,
+              disconnectedAt: null,
+            };
+            playerObj.user = ensureAvatarAbs(playerObj.user);
+
+            room.players.push(playerObj);
+            assignedColor = "spectator";
+            socket.emit("player-assigned", { color: "spectator" });
+          }
+
+          broadcastRoomState(roomId);
+
+          socket.join(roomId);
+          socket.emit("room-created", {
+            ok: true,
+            roomId,
+            settings: room.settings,
+            assignedColor,
+          });
+          console.log(
+            "Room created:",
+            roomId,
+            "by",
+            socket.user?.username || socket.id
+          );
+        } catch (err) {
+          console.error("create-room outer error", err);
+          socket.emit("room-created", { ok: false, error: "Server error" });
+        }
+      }
+    );
+
+    socket.on("join-room", async ({ roomId, user }) => {
+      if (!roomId) return;
+
+      // if room not in memory, attempt to load persisted room
+      if (!rooms[roomId]) {
+        try {
+          const doc = await Room.findOne({ roomId }).lean().exec();
+          if (doc) {
+            socket.join(roomId);
+            socket.emit("room-update", {
+              players: (doc.players || []).map((p) => ({
+                id: p.id,
+                user: p.user,
+                color: p.color,
+                online: !!p.online,
+                disconnectedAt: p.disconnectedAt || null,
+              })),
+              moves: doc.moves || [],
+              fen: doc.fen || null,
+              lastIndex:
+                typeof doc.lastIndex !== "undefined" ? doc.lastIndex : -1,
+              clocks: doc.clocks || null,
+              finished: doc.finished || null,
+              pendingDrawOffer: doc.pendingDrawOffer || null,
+              settings: doc.settings || null,
+              messages: (doc.messages || []).slice(
+                -Math.min(MAX_CHAT_MESSAGES, doc.messages.length || 0)
+              ),
+              pendingRematch: doc.rematch
+                ? {
+                    initiatorSocketId: doc.rematch.initiatorSocketId || null,
+                    initiatorUserId: doc.rematch.initiatorUserId || null,
+                    acceptedBy: doc.rematch.acceptedBy
+                      ? Object.keys(doc.rematch.acceptedBy)
+                      : [],
+                  }
+                : null,
+            });
+
+            if (doc.finished) {
+              socket.emit("room-finished", {
+                roomId,
+                finished: true,
+                message:
+                  doc.finished.message ||
+                  "This room has finished and is view-only.",
+              });
+            }
+
+            return;
+          } else {
+            try {
+              socket.emit("no-such-room", { roomId });
+            } catch (e) {}
+            return;
+          }
+        } catch (err) {
+          console.error("join-room: error loading persisted room", err);
+          try {
+            socket.emit("no-such-room", { roomId });
+          } catch (e) {}
+          return;
+        }
+      }
+
+      // in-memory join
+      socket.join(roomId);
+      const room = rooms[roomId];
+
+      if (!room.chess) {
+        room.chess = room.fen ? new Chess(room.fen) : new Chess();
+        room.fen = room.chess.fen();
+        room.lastIndex = room.moves.length
+          ? room.moves[room.moves.length - 1].index
+          : -1;
+      }
+
+      const candidateUserId =
+        socket.user?.id ?? user?.id ?? user?._id
+          ? String(socket.user?.id ?? user?.id ?? user?._id)
+          : null;
+      const candidateUsername =
+        socket.user?.username ??
+        user?.username ??
+        (user && user.fromUsername) ??
+        null;
+
+      // server-side guard: deny if DB user already has activeRoom different from this
+      if (candidateUserId) {
+        try {
+          const dbUser = await User.findById(candidateUserId).lean().exec();
+          if (
+            dbUser &&
+            dbUser.activeRoom &&
+            String(dbUser.activeRoom) !== String(roomId)
+          ) {
+            try {
+              socket.emit("join-denied-active-room", {
+                reason: "already_active",
+                message: "You already have an active game.",
+                activeRoom: dbUser.activeRoom,
+              });
+              socket.emit("notification", {
+                type: "join_denied_active_room",
+                activeRoom: dbUser.activeRoom,
+                message: "You already have an active game.",
+              });
+            } catch (e) {}
+            return;
+          }
+        } catch (err) {
+          console.error("join-room: error checking user activeRoom", err);
+        }
+      }
+
+      // find existing player entry
+      let existing = null;
+      if (candidateUserId) {
+        existing = room.players.find(
+          (p) => p.user && String(p.user.id || p.user._id) === candidateUserId
+        );
+      }
+      if (!existing && candidateUsername) {
+        existing = room.players.find(
+          (p) => p.user && p.user.username === candidateUsername
+        );
+      }
+      if (!existing) {
+        existing = room.players.find((p) => p.id === socket.id);
+      }
+
+      if (existing) {
+        clearDisconnectTimer(room, existing.id);
+        existing.id = socket.id;
+        existing.user = socket.user ||
+          existing.user ||
+          user || { username: "guest" };
+        existing.user = ensureAvatarAbs(existing.user);
+        existing.online = true;
+        existing.disconnectedAt = null;
+
+        socket.emit("player-assigned", {
+          color: existing.color || "spectator",
+        });
+
+        // mark DB user activeRoom if playing seat
+        if (
+          existing.user &&
+          (existing.color === "w" || existing.color === "b")
+        ) {
+          (async () => {
+            try {
+              const uid = existing.user.id || existing.user._id;
+              await markUserActiveRoom(uid, roomId);
+            } catch (e) {
+              console.error(
+                "markUserActiveRoom after existing player assignment failed",
+                e
+              );
+            }
+          })();
+        }
+      } else {
+        // new player
+        let assignedColor = "spectator";
+        if (socket.user) {
+          const wTaken = room.players.some((p) => p.color === "w");
+          const bTaken = room.players.some((p) => p.color === "b");
+          if (!wTaken) assignedColor = "w";
+          else if (!bTaken) assignedColor = "b";
+          else assignedColor = "spectator";
+        } else {
+          assignedColor = "spectator";
+        }
+
+        const playerObj = {
+          id: socket.id,
+          user: socket.user || user || { username: "guest" },
+          color: assignedColor,
+          online: true,
+          disconnectedAt: null,
+        };
+        playerObj.user = ensureAvatarAbs(playerObj.user);
+
+        room.players.push(playerObj);
+        socket.emit("player-assigned", { color: playerObj.color });
+
+        // mark DB user activeRoom if assigned playing seat
+        (async () => {
+          try {
+            const uid =
+              playerObj.user && (playerObj.user.id || playerObj.user._id);
+            if (uid && (playerObj.color === "w" || playerObj.color === "b")) {
+              await markUserActiveRoom(uid, roomId);
+            }
+          } catch (e) {
+            console.error("markUserActiveRoom error after new player push", e);
+          }
+        })();
+      }
+
+      clearDisconnectTimer(room, socket.id);
+
+      // clocks / ready notifications
+      const coloredPlayers = room.players.filter(
+        (p) => p.color === "w" || p.color === "b"
+      );
+
+      if (!room.clocks && !room.finished) {
+        if (coloredPlayers.length === 2) {
+          const minutes =
+            room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
+          const ms = room.settings?.minutesMs || minutes * 60 * 1000;
+          room.clocks = {
+            w: ms,
+            b: ms,
+            running: room.chess.turn(),
+            lastTick: Date.now(),
+          };
+          scheduleFirstMoveTimer(roomId);
+        }
+      } else {
+        if (
+          coloredPlayers.length === 2 &&
+          !room.clocks?.running &&
+          !room.finished
+        ) {
+          room.clocks.running = room.chess.turn();
+          room.clocks.lastTick = Date.now();
+          room.paused = false;
+          scheduleFirstMoveTimer(roomId);
+        }
+      }
+
+      broadcastRoomState(roomId);
+
+      if (coloredPlayers.length === 2 && !room.finished) {
+        io.to(roomId).emit("room-ready", {
+          ok: true,
+          message: "Two players connected — game ready",
+        });
+      } else if (!room.finished) {
+        io.to(roomId).emit("room-waiting", {
+          ok: false,
+          message: "Waiting for second player...",
+        });
+      } else {
+        io.to(roomId).emit("game-over", { ...room.finished });
+      }
+    });
+
+    socket.on("make-move", async ({ roomId, move }) => {
+      try {
+        if (!roomId || !move) return;
+        const room = rooms[roomId];
+        if (!room) {
+          socket.emit("error", { error: "Room not found" });
+          return;
+        }
+
+        if (room.finished) {
+          socket.emit("game-over", { ...room.finished });
+          return;
+        }
+
+        const player = room.players.find((p) => p.id === socket.id) || null;
+        if (!player) {
+          socket.emit("not-your-room", { error: "You are not in this room" });
+          return;
+        }
+        if (player.color === "spectator") {
+          socket.emit("not-your-turn", { error: "Spectators cannot move" });
+          return;
+        }
+
+        const colored = room.players.filter(
+          (p) => p.color === "w" || p.color === "b"
+        );
+        if (colored.length < 2) {
+          socket.emit("not-enough-players", {
+            error: "Game requires two players to start",
+          });
+          io.to(roomId).emit("room-waiting", {
+            ok: false,
+            message: "Waiting for second player...",
+          });
+          return;
+        }
+
+        if (!room.chess)
+          room.chess = room.fen ? new Chess(room.fen) : new Chess();
+        const chess = room.chess;
+
+        const currentTurn = chess.turn();
+        if (!currentTurn) {
+          socket.emit("error", { error: "Unable to determine turn" });
+          return;
+        }
+        if (player.color !== currentTurn) {
+          socket.emit("not-your-turn", {
+            error: "It is not your turn",
+            currentTurn,
+          });
+          return;
+        }
+
+        try {
+          if (move && move.promotion) {
+            const p = normalizePromotionChar(move.promotion);
+            if (p) move.promotion = p;
+            else delete move.promotion;
+          }
+        } catch (e) {}
+
+        const result = chess.move(move);
+        if (!result) {
+          socket.emit("invalid-move", {
+            reason: "illegal move on server",
+            move,
+          });
+          socket.emit("room-update", {
+            players: room.players.map(mapPlayerForEmit),
+            moves: room.moves,
+            fen: chess.fen(),
+            lastIndex: room.lastIndex,
+            clocks: room.clocks
+              ? {
+                  w: room.clocks.w,
+                  b: room.clocks.b,
+                  running: room.clocks.running,
+                }
+              : null,
+            finished: room.finished || null,
+            messages: (room.messages || []).slice(
+              -Math.min(MAX_CHAT_MESSAGES, room.messages.length)
+            ),
+          });
+          return;
+        }
+
+        room.lastIndex = (room.lastIndex ?? -1) + 1;
+        const record = { index: room.lastIndex, move };
+        room.moves.push(record);
+        room.fen = chess.fen();
+
+        clearFirstMoveTimer(room);
+
+        let finishedObj = null;
+
+        const gameOver =
+          (typeof chess.game_over === "function" && chess.game_over()) || false;
+        let isCheckmate =
+          (typeof chess.in_checkmate === "function" && chess.in_checkmate()) ||
+          false;
+        let isStalemate =
+          (typeof chess.in_stalemate === "function" && chess.in_stalemate()) ||
+          false;
+        const isThreefold =
+          (typeof chess.in_threefold_repetition === "function" &&
+            chess.in_threefold_repetition()) ||
+          false;
+        const isInsufficient =
+          (typeof chess.insufficient_material === "function" &&
+            chess.insufficient_material()) ||
+          false;
+        const isDraw =
+          (typeof chess.in_draw === "function" && chess.in_draw()) || false;
+
+        try {
+          if (!isCheckmate && !isStalemate) {
+            let movesList = [];
+            try {
+              movesList =
+                typeof chess.moves === "function"
+                  ? chess.moves({ verbose: true })
+                  : [];
+            } catch (e) {
+              try {
+                movesList =
+                  typeof chess.moves === "function" ? chess.moves() : [];
+              } catch (e2) {
+                movesList = [];
+              }
+            }
+            if (!Array.isArray(movesList)) movesList = [];
+
+            if (movesList.length === 0) {
+              const inCheckNow =
+                (typeof chess.in_check === "function" && chess.in_check()) ||
+                (typeof chess.inCheck === "function" && chess.inCheck()) ||
+                false;
+              if (inCheckNow) isCheckmate = true;
+              else isStalemate = true;
+
+              console.warn(
+                "[GAME DETECTION FALLBACK] no legal moves ->",
+                `inCheckNow=${inCheckNow}, isCheckmate=${isCheckmate}, isStalemate=${isStalemate}`,
+                "move:",
+                JSON.stringify(move),
+                "fen:",
+                (() => {
+                  try {
+                    return chess.fen();
+                  } catch {
+                    return "<fen-error>";
+                  }
+                })()
+              );
+            }
+          }
+        } catch (e) {
+          console.error("Fallback detection error:", e);
+        }
+
+        if (isCheckmate) {
+          const winner = result.color;
+          const loser = winner === "w" ? "b" : "w";
+          finishedObj = {
+            reason: "checkmate",
+            winner,
+            loser,
+            message: `${winner.toUpperCase()} wins by checkmate`,
+            finishedAt: Date.now(),
+          };
+        } else if (isStalemate) {
+          finishedObj = {
+            reason: "stalemate",
+            result: "draw",
+            message: "Draw by stalemate",
+            finishedAt: Date.now(),
+          };
+        } else if (isThreefold) {
+          finishedObj = {
+            reason: "threefold-repetition",
+            result: "draw",
+            message: "Draw by threefold repetition",
+            finishedAt: Date.now(),
+          };
+        } else if (isInsufficient) {
+          finishedObj = {
+            reason: "insufficient-material",
+            result: "draw",
+            message: "Draw by insufficient material",
+            finishedAt: Date.now(),
+          };
+        } else if (isDraw || gameOver) {
+          finishedObj = {
+            reason: "draw",
+            result: "draw",
+            message: "Draw",
+            finishedAt: Date.now(),
+          };
+        }
+
+        if (!room.clocks) {
+          if (!finishedObj) {
+            const minutes =
+              room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
+            const ms = room.settings?.minutesMs || minutes * 60 * 1000;
+            room.clocks = {
+              w: ms,
+              b: ms,
+              running: chess.turn(),
+              lastTick: Date.now(),
+            };
+          } else {
+            room.clocks = {
+              w: room.clocks?.w ?? DEFAULT_MS,
+              b: room.clocks?.b ?? DEFAULT_MS,
+              running: null,
+              lastTick: null,
+            };
+          }
+        } else {
+          if (finishedObj) {
+            room.paused = true;
+            room.clocks.running = null;
+            room.clocks.lastTick = null;
+          } else {
+            room.clocks.running = chess.turn();
+            room.clocks.lastTick = Date.now();
+          }
+        }
+
+        if (room.pendingDrawOffer) {
+          if (
+            room.pendingDrawOffer.fromSocketId === player.id ||
+            (player.user && room.pendingDrawOffer.fromUserId === player.user.id)
+          ) {
+            room.pendingDrawOffer = null;
+          }
+        }
+
+        socket.to(roomId).emit("opponent-move", {
+          ...record,
+          fen: room.fen,
+          clocks: room.clocks
+            ? {
+                w: room.clocks.w,
+                b: room.clocks.b,
+                running: room.clocks.running,
+              }
+            : null,
+        });
+
+        if (finishedObj) {
+          room.finished = finishedObj;
+          room.paused = true;
+          if (room.clocks) {
+            room.clocks.running = null;
+            room.clocks.lastTick = null;
+          }
+
+          io.to(roomId).emit("game-over", { ...room.finished });
+          clearFirstMoveTimer(room);
+          Object.keys(room.disconnectTimers || {}).forEach((sid) =>
+            clearDisconnectTimer(room, sid)
+          );
+          broadcastRoomState(roomId);
+          try {
+            await context.saveFinishedGame(roomId);
+          } catch (err) {
+            console.error("saveFinishedGame error (make-move):", err);
+          }
+          try {
+            await applyCupsForFinishedRoom(roomId);
+          } catch (e) {
+            console.error("applyCupsForFinishedRoom error (make-move):", e);
+          }
+        } else {
+          broadcastRoomState(roomId);
+        }
+      } catch (err) {
+        console.error("make-move error", err);
+      }
+    });
+
+    socket.on("resign", async ({ roomId }) => {
+      if (!roomId) return;
+      try {
+        const room = rooms[roomId];
+        if (!room) return;
+        const playerIdx = room.players.findIndex((p) => p.id === socket.id);
+        if (playerIdx === -1) return;
+        const player = room.players[playerIdx];
+
+        if ((player.color === "w" || player.color === "b") && !room.finished) {
+          const winnerColor = player.color === "w" ? "b" : "w";
+          room.paused = true;
+          if (room.clocks) {
+            room.clocks.running = null;
+            room.clocks.lastTick = null;
+          }
+          room.finished = {
+            reason: "resign",
+            winner: winnerColor,
+            loser: player.color,
+            message: `Player ${player.user?.username || player.id} resigned`,
+            finishedAt: Date.now(),
+          };
+          io.to(roomId).emit("game-over", { ...room.finished });
+          clearFirstMoveTimer(room);
+          Object.keys(room.disconnectTimers || {}).forEach((sid) =>
+            clearDisconnectTimer(room, sid)
+          );
+          broadcastRoomState(roomId);
+
+          // clear DB activeRoom for both players in this room
+          try {
+            await clearActiveRoomForRoom(room);
+          } catch (e) {
+            console.error("clearActiveRoomForRoom after resign failed", e);
+          }
+
+          try {
+            await context.saveFinishedGame(roomId);
+          } catch (err) {
+            console.error("saveFinishedGame error (resign):", err);
+          }
+          try {
+            await applyCupsForFinishedRoom(roomId);
+          } catch (e) {
+            console.error("applyCupsForFinishedRoom error (resign):", e);
+          }
+        }
+
+        room.players = room.players.filter((p) => p.id !== socket.id);
+        broadcastRoomState(roomId);
+      } catch (err) {
+        console.error("resign handler error", err);
+      }
+    });
+
+    socket.on("offer-draw", async ({ roomId }) => {
+      if (!roomId) return;
+      const room = rooms[roomId];
+      if (!room || room.finished) return;
+      const player = room.players.find((p) => p.id === socket.id);
+      if (!player) return;
+      if (!(player.color === "w" || player.color === "b")) return;
+
+      room.pendingDrawOffer = {
+        fromSocketId: socket.id,
+        fromUserId: player.user?.id || null,
+      };
+
+      const opponent = room.players.find(
+        (p) => p.color !== player.color && (p.color === "w" || p.color === "b")
+      );
+      if (opponent) {
+        io.to(opponent.id).emit("draw-offered", { from: player.user });
+        // Persist notification for opponent
+        try {
+          const targetUserId = opponent.user?.id || opponent.id;
+          await notificationService.createNotification(
+            String(targetUserId),
+            "draw_offer",
+            "Draw offered",
+            `${player.user?.username || "Opponent"} offered a draw.`,
+            { fromUserId: player.user?.id || null, roomId }
+          );
+        } catch (e) {
+          console.error("createNotification (draw_offer) failed", e);
+        }
+      }
+      broadcastRoomState(roomId);
+    });
+
+    socket.on("accept-draw", async ({ roomId }) => {
+      if (!roomId) return;
+      const room = rooms[roomId];
+      if (!room) return;
+      if (room.finished) {
+        socket.emit("game-over", { ...room.finished });
+        return;
+      }
+      const offer = room.pendingDrawOffer;
+      if (!offer) return;
+
+      let offerer = null;
+      if (offer.fromUserId)
+        offerer = room.players.find(
+          (p) => p.user && p.user.id === offer.fromUserId
+        );
+      if (!offerer && offer.fromSocketId)
+        offerer = room.players.find((p) => p.id === offer.fromSocketId);
+
+      const acceptor = room.players.find((p) => p.id === socket.id);
+      if (!offerer || !acceptor) return;
+      if (offerer.color === acceptor.color) return;
+
+      room.paused = true;
+      if (room.clocks) {
+        room.clocks.running = null;
+        room.clocks.lastTick = null;
+      }
+      room.pendingDrawOffer = null;
+      room.finished = {
+        reason: "draw-agreed",
+        result: "draw",
+        message: "Game drawn by agreement",
+        finishedAt: Date.now(),
+      };
+      io.to(roomId).emit("game-over", { ...room.finished });
+      clearFirstMoveTimer(room);
+      Object.keys(room.disconnectTimers || {}).forEach((sid) =>
+        clearDisconnectTimer(room, sid)
+      );
+      broadcastRoomState(roomId);
+      try {
+        await context.saveFinishedGame(roomId);
+      } catch (err) {
+        console.error("saveFinishedGame error (accept-draw):", err);
+      }
+      try {
+        await applyCupsForFinishedRoom(roomId);
+      } catch (e) {
+        console.error("applyCupsForFinishedRoom error (accept-draw):", e);
+      }
+
+      // Persist notifications
+      try {
+        const offererId = offerer.user?.id || offerer.id;
+        const acceptorId = acceptor.user?.id || acceptor.id;
+        await notificationService.createNotification(
+          String(offererId),
+          "draw_accepted",
+          "Draw accepted",
+          `${acceptor.user?.username || "Opponent"} accepted your draw.`,
+          { roomId }
+        );
+        await notificationService.createNotification(
+          String(acceptorId),
+          "draw_confirmed",
+          "Draw confirmed",
+          `You accepted a draw.`,
+          { roomId }
+        );
+      } catch (e) {
+        console.error("createNotification (draw accepted) failed", e);
+      }
+
+      // mark original draw_offer notification as read + emit update
+      try {
+        const orig = await Notification.findOneAndUpdate(
+          { "data.roomId": roomId, userId: String(socket.user?.id) },
+          {
+            $set: {
+              read: true,
+              updatedAt: Date.now(),
+              "data.status": "accepted",
+            },
+          },
+          { new: true }
+        )
+          .lean()
+          .exec();
+        if (orig) {
+          try {
+            const payload = {
+              id: orig._id?.toString(),
+              _id: orig._id?.toString(),
+              userId: orig.userId,
+              type: orig.type,
+              title: orig.title,
+              body: orig.body,
+              data: orig.data,
+              read: orig.read,
+              createdAt: orig.createdAt,
+              updatedAt: orig.updatedAt,
+            };
+            io.to(`user:${String(socket.user?.id)}`).emit(
+              "notification",
+              payload
+            );
+          } catch (e) {}
+        }
+      } catch (e) {
+        console.error(
+          "accept-draw: mark original draw_offer notification failed",
+          e
+        );
+      }
+    });
+
+    socket.on("decline-draw", ({ roomId }) => {
+      try {
+        if (!roomId) return;
+        const room = rooms[roomId];
+        if (!room) return;
+        room.pendingDrawOffer = null;
+        broadcastRoomState(roomId);
+
+        // mark original draw_offer as declined for this user
+        (async () => {
+          try {
+            const orig = await Notification.findOneAndUpdate(
+              { "data.roomId": roomId, userId: String(socket.user?.id) },
+              {
+                $set: {
+                  read: true,
+                  updatedAt: Date.now(),
+                  "data.status": "declined",
+                },
+              },
+              { new: true }
+            )
+              .lean()
+              .exec();
+            if (orig) {
+              try {
+                io.to(`user:${String(socket.user?.id)}`).emit("notification", {
+                  id: orig._id?.toString(),
+                  _id: orig._id?.toString(),
+                  ...orig,
+                });
+              } catch (e) {}
+            }
+          } catch (e) {
+            console.error(
+              "decline-draw: mark original draw_offer notification failed",
+              e
+            );
+          }
+        })();
+      } catch (err) {
+        console.error("decline-draw error", err);
+      }
+    });
+
+    socket.on("send-chat", ({ roomId, text }) => {
+      try {
+        if (!roomId) return;
+        const room = rooms[roomId];
+        if (!room) return;
+        if (!text || typeof text !== "string") return;
+        const trimmed = text.trim().slice(0, 2000);
+        if (!trimmed) return;
+
+        const msg = {
+          id: `${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+          text: trimmed,
+          ts: Date.now(),
+          user: socket.user || { username: socket.user?.username || "guest" },
+        };
+
+        room.messages = room.messages || [];
+        room.messages.push(msg);
+        if (room.messages.length > MAX_CHAT_MESSAGES)
+          room.messages = room.messages.slice(-MAX_CHAT_MESSAGES);
+
+        io.to(roomId).emit("chat-message", msg);
+        broadcastRoomState(roomId);
+      } catch (err) {
+        console.error("send-chat error", err);
+      }
+    });
+
+    socket.on("player-timeout", async ({ roomId, loser }) => {
+      if (!roomId || !loser) return;
+      const room = rooms[roomId];
+      if (!room) return;
+      if (room.finished) {
+        socket.emit("game-over", { ...room.finished });
+        return;
+      }
+      if (
+        room.clocks &&
+        typeof room.clocks[loser] === "number" &&
+        room.clocks[loser] <= 0
+      ) {
+        room.paused = true;
+        if (room.clocks) {
+          room.clocks.running = null;
+          room.clocks.lastTick = null;
+        }
+        const winner = loser === "w" ? "b" : "w";
+        room.finished = {
+          reason: "timeout",
+          winner,
+          loser,
+          message: `${winner.toUpperCase()} wins by timeout`,
+          finishedAt: Date.now(),
+        };
+        io.to(roomId).emit("game-over", { ...room.finished });
+        clearFirstMoveTimer(room);
+        Object.keys(room.disconnectTimers || {}).forEach((sid) =>
+          clearDisconnectTimer(room, sid)
+        );
+        broadcastRoomState(roomId);
+        try {
+          await context.saveFinishedGame(roomId);
+        } catch (err) {
+          console.error("saveFinishedGame error (player-timeout):", err);
+        }
+        try {
+          await applyCupsForFinishedRoom(roomId);
+        } catch (e) {
+          console.error("applyCupsForFinishedRoom error (player-timeout):", e);
+        }
+      }
+    });
+
+    socket.on("request-sync", async ({ roomId }) => {
+      try {
+        if (!roomId || !rooms[roomId]) {
+          try {
+            const doc = await Room.findOne({ roomId }).lean().exec();
+            if (!doc) {
+              socket.emit("room-update", {
+                players: [],
+                moves: [],
+                fen: null,
+                lastIndex: -1,
+                clocks: null,
+                finished: null,
+                messages: [],
+              });
+              return;
+            }
+
+            socket.emit("room-update", {
+              players: (doc.players || []).map((p) => ({
+                id: p.id,
+                user: p.user,
+                color: p.color,
+                online: !!p.online,
+                disconnectedAt: p.disconnectedAt || null,
+              })),
+              moves: doc.moves || [],
+              fen: doc.fen || null,
+              lastIndex:
+                typeof doc.lastIndex !== "undefined" ? doc.lastIndex : -1,
+              clocks: doc.clocks || null,
+              finished: doc.finished || null,
+              pendingDrawOffer: doc.pendingDrawOffer || null,
+              settings: doc.settings || null,
+              messages: (doc.messages || []).slice(
+                -Math.min(MAX_CHAT_MESSAGES, doc.messages.length || 0)
+              ),
+              pendingRematch: doc.rematch
+                ? {
+                    initiatorSocketId: doc.rematch.initiatorSocketId || null,
+                    initiatorUserId: doc.rematch.initiatorUserId || null,
+                    acceptedBy: doc.rematch.acceptedBy
+                      ? Object.keys(doc.rematch.acceptedBy)
+                      : [],
+                  }
+                : null,
+            });
+            return;
+          } catch (err) {
+            socket.emit("room-update", {
+              players: [],
+              moves: [],
+              fen: null,
+              lastIndex: -1,
+              clocks: null,
+              finished: null,
+              messages: [],
+            });
+            return;
+          }
+        }
+
+        const r = rooms[roomId];
+
+        socket.emit("room-update", {
+          players: r.players.map(mapPlayerForEmit),
+          moves: r.moves,
+          fen: r.chess ? r.chess.fen() : r.fen,
+          lastIndex: r.lastIndex,
+          clocks: r.clocks
+            ? { w: r.clocks.w, b: r.clocks.b, running: r.clocks.running }
+            : null,
+          finished: r.finished || null,
+          pendingDrawOffer: (() => {
+            if (!r.pendingDrawOffer) return null;
+            let offerer = null;
+            if (r.pendingDrawOffer.fromUserId)
+              offerer = r.players.find(
+                (p) => p.user && p.user.id === r.pendingDrawOffer.fromUserId
+              );
+            if (!offerer && r.pendingDrawOffer.fromSocketId)
+              offerer = r.players.find(
+                (p) => p.id === r.pendingDrawOffer.fromSocketId
+              );
+            if (offerer && offerer.user) {
+              const u = offerer.user;
+              return {
+                from: {
+                  id: u.id,
+                  username: u.username,
+                  displayName: u.displayName,
+                  avatarUrl:
+                    u.avatarUrl || u.avatarUrlAbsolute || u.avatar || null,
+                  avatarUrlAbsolute:
+                    u.avatarUrlAbsolute ||
+                    (u.avatarUrl && String(u.avatarUrl).startsWith("http")
+                      ? u.avatarUrl
+                      : u.avatarUrl
+                      ? `${context.computeBaseUrl()}${u.avatarUrl}`
+                      : null),
+                },
+              };
+            }
+            return null;
+          })(),
+          settings: r.settings || null,
+          messages: (r.messages || []).slice(
+            -Math.min(MAX_CHAT_MESSAGES, r.messages || 0)
+          ),
+          pendingRematch: r.rematch
+            ? {
+                initiatorSocketId: r.rematch.initiatorSocketId || null,
+                initiatorUserId: r.rematch.initiatorUserId || null,
+                acceptedBy: r.rematch.acceptedBy
+                  ? Object.keys(r.rematch.acceptedBy)
+                  : [],
+              }
+            : null,
+        });
+      } catch (err) {
+        console.error("request-sync error", err);
+      }
+    });
+
+    socket.on("leave-room", async ({ roomId }) => {
+      if (!roomId || !rooms[roomId]) return;
+      const room = rooms[roomId];
+      socket.leave(roomId);
+      const idx = room.players.findIndex((p) => p.id === socket.id);
+      if (idx === -1) return;
+      const player = room.players[idx];
+
+      if ((player.color === "w" || player.color === "b") && !room.finished) {
+        const winnerColor = player.color === "w" ? "b" : "w";
+        room.paused = true;
+        if (room.clocks) {
+          room.clocks.running = null;
+          room.clocks.lastTick = null;
+        }
+        room.finished = {
+          reason: "leave-resign",
+          winner: winnerColor,
+          loser: player.color,
+          message: `Player ${player.user?.username || player.id} left (resign)`,
+          finishedAt: Date.now(),
+        };
+        io.to(roomId).emit("game-over", { ...room.finished });
+        clearFirstMoveTimer(room);
+        Object.keys(room.disconnectTimers || {}).forEach((sid) =>
+          clearDisconnectTimer(room, sid)
+        );
+        broadcastRoomState(roomId);
+        try {
+          await context.saveFinishedGame(roomId);
+        } catch (err) {
+          console.error("saveFinishedGame error (leave-room):", err);
+        }
+        try {
+          await applyCupsForFinishedRoom(roomId);
+        } catch (e) {
+          console.error("applyCupsForFinishedRoom error (leave-room):", e);
+        }
+      }
+
+      // remove player socket entry
+      room.players = room.players.filter((p) => p.id !== socket.id);
+      broadcastRoomState(roomId);
+
+      // Best-effort: clear activeRoom for this user in DB (if authenticated)
+      try {
+        const uid = String(player?.user?.id || player?.user?._id || "");
+        if (uid)
+          await User.updateOne(
+            { _id: uid },
+            { $set: { activeRoom: null } }
+          ).exec();
+      } catch (e) {
+        console.warn("leave-room: failed to clear activeRoom (non-fatal):", e);
+      }
+    });
+
+    socket.on("save-game", ({ roomId, fen, moves, players }) => {
+      io.to(roomId).emit("game-saved", { ok: true });
+    });
+
+    socket.on("play-again", async ({ roomId }) => {
+      try {
+        if (!roomId) return;
+        const room = rooms[roomId];
+        if (!room) return;
+
+        if (!room.finished && (!room.moves || room.moves.length === 0)) {
+          socket.emit("play-again", {
+            ok: false,
+            started: false,
+            error: "No finished game to rematch",
+          });
+          return;
+        }
+
+        const player = room.players.find((p) => p.id === socket.id);
+        if (!player) {
+          socket.emit("play-again", {
+            ok: false,
+            started: false,
+            error: "Not in room",
+          });
+          return;
+        }
+
+        room.rematch = room.rematch || {
+          initiatorSocketId: socket.id,
+          initiatorUserId: player.user?.id || null,
+          acceptedBy: {},
+        };
+        room.rematch.initiatorSocketId = socket.id;
+        room.rematch.initiatorUserId = player.user?.id || null;
+
+        room.rematch.acceptedBy = room.rematch.acceptedBy || {};
+        room.rematch.acceptedBy[socket.id] = true;
+
+        const opponent = room.players.find(
+          (p) =>
+            p.color !== player.color && (p.color === "w" || p.color === "b")
+        );
+        if (opponent) {
+          io.to(opponent.id).emit("rematch-offered", {
+            from: player.user || { username: "Guest" },
+          });
+
+          // Persist rematch notification
+          try {
+            const targetUserId = opponent.user?.id || opponent.id;
+            await notificationService.createNotification(
+              String(targetUserId),
+              "rematch",
+              "Rematch offered",
+              `${player.user?.username || "Opponent"} offered a rematch.`,
+              { fromUserId: player.user?.id || null, roomId }
+            );
+          } catch (e) {
+            console.error("createNotification (rematch) failed", e);
+          }
+        }
+
+        socket.emit("play-again", {
+          ok: true,
+          started: false,
+          message: "Rematch requested",
+        });
+        broadcastRoomState(roomId);
+      } catch (err) {
+        console.error("play-again error", err);
+        socket.emit("play-again", {
+          ok: false,
+          started: false,
+          error: "Server error",
+        });
+      }
+    });
+
+    socket.on("accept-play-again", async ({ roomId }) => {
+      try {
+        if (!roomId) return;
+        const room = rooms[roomId];
+        if (!room || !room.rematch) {
+          socket.emit("play-again", {
+            ok: false,
+            started: false,
+            error: "No rematch pending",
+          });
+          return;
+        }
+        const player = room.players.find((p) => p.id === socket.id);
+        if (!player) {
+          socket.emit("play-again", {
+            ok: false,
+            started: false,
+            error: "Not in room",
+          });
+          return;
+        }
+
+        room.rematch.acceptedBy = room.rematch.acceptedBy || {};
+        room.rematch.acceptedBy[socket.id] = true;
+
+        const coloredPlayers = room.players.filter(
+          (p) => p.color === "w" || p.color === "b"
+        );
+        const coloredIds = coloredPlayers.map((p) => p.id).filter(Boolean);
+        const acceptedKeys = Object.keys(room.rematch.acceptedBy || {});
+
+        let required = [];
+        if (coloredIds.length === 2) required = coloredIds;
+        else if (coloredIds.length === 1)
+          required = Array.from(
+            new Set([room.rematch.initiatorSocketId, coloredIds[0]])
+          ).filter(Boolean);
+        else required = [room.rematch.initiatorSocketId].filter(Boolean);
+
+        const allAccepted =
+          required.length > 0 &&
+          required.every((id) => acceptedKeys.includes(id));
+
+        if (allAccepted) {
+          try {
+            const res = await context.roomManager.createRematchFrom(roomId);
+            if (res && res.ok && res.roomId) {
+              const newRoomId = res.roomId;
+              try {
+                if (rooms[roomId]) {
+                  rooms[roomId].rematch = null;
+                  broadcastRoomState(roomId);
+                }
+              } catch (e) {}
+              io.to(newRoomId).emit("play-again", {
+                ok: true,
+                started: true,
+                message: "Rematch started",
+                roomId: newRoomId,
+              });
+
+              try {
+                const newRoom = rooms[newRoomId];
+                if (newRoom && Array.isArray(newRoom.players)) {
+                  for (const p of newRoom.players) {
+                    try {
+                      io.to(p.id).emit("player-assigned", { color: p.color });
+                    } catch (e) {}
+                  }
+                }
+              } catch (e) {}
+
+              try {
+                const newRoom = rooms[newRoomId];
+                if (newRoom && Array.isArray(newRoom.players)) {
+                  for (const p of newRoom.players) {
+                    const uid = p.user?.id || p.id;
+                    if (!uid) continue;
+                    await notificationService.createNotification(
+                      String(uid),
+                      "rematch_started",
+                      "Rematch started",
+                      `Rematch started in room ${newRoomId}`,
+                      { roomId: newRoomId }
+                    );
+                  }
+                }
+              } catch (e) {
+                console.error("createNotification (rematch_started) failed", e);
+              }
+            } else {
+              broadcastRoomState(roomId);
+              socket.emit("play-again", {
+                ok: false,
+                started: false,
+                error: "rematch-create-failed",
+              });
+            }
+          } catch (err) {
+            console.error("createRematchFrom error", err);
+            socket.emit("play-again", {
+              ok: false,
+              started: false,
+              error: "Server error",
+            });
+          }
+        } else {
+          broadcastRoomState(roomId);
+        }
+
+        // mark original rematch notification read + emit update
+        try {
+          const orig = await Notification.findOneAndUpdate(
+            { "data.roomId": roomId, userId: String(socket.user?.id) },
+            {
+              $set: {
+                read: true,
+                updatedAt: Date.now(),
+                "data.status": "accepted",
+              },
+            },
+            { new: true }
+          )
+            .lean()
+            .exec();
+          if (orig) {
+            try {
+              const payload = {
+                id: orig._id?.toString(),
+                _id: orig._id?.toString(),
+                userId: orig.userId,
+                type: orig.type,
+                title: orig.title,
+                body: orig.body,
+                data: orig.data,
+                read: orig.read,
+                createdAt: orig.createdAt,
+                updatedAt: orig.updatedAt,
+              };
+              io.to(`user:${String(socket.user?.id)}`).emit(
+                "notification",
+                payload
+              );
+            } catch (e) {}
+          }
+        } catch (e) {
+          console.error(
+            "accept-play-again: mark original rematch notification failed",
+            e
+          );
+        }
+      } catch (err) {
+        console.error("accept-play-again error", err);
+        socket.emit("play-again", {
+          ok: false,
+          started: false,
+          error: "Server error",
+        });
+      }
+    });
+
+    socket.on("decline-play-again", ({ roomId }) => {
+      try {
+        if (!roomId) return;
+        const room = rooms[roomId];
+        if (!room || !room.rematch) return;
+
+        const initiatorId = room.rematch.initiatorSocketId;
+        if (initiatorId) {
+          io.to(initiatorId).emit("rematch-declined", {
+            message: "Opponent declined rematch",
+          });
+        }
+        room.rematch = null;
+        broadcastRoomState(roomId);
+
+        // mark original rematch notification read/declined
+        (async () => {
+          try {
+            const orig = await Notification.findOneAndUpdate(
+              { "data.roomId": roomId, userId: String(socket.user?.id) },
+              {
+                $set: {
+                  read: true,
+                  updatedAt: Date.now(),
+                  "data.status": "declined",
+                },
+              },
+              { new: true }
+            )
+              .lean()
+              .exec();
+            if (orig) {
+              try {
+                io.to(`user:${String(socket.user?.id)}`).emit("notification", {
+                  id: orig._1d?.toString(),
+                  _id: orig._id?.toString(),
+                  ...orig,
+                });
+              } catch (e) {}
+            }
+          } catch (e) {
+            console.error(
+              "decline-play-again: mark original rematch notification failed",
+              e
+            );
+          }
+        })();
+      } catch (err) {
+        console.error("decline-play-again error", err);
+      }
+    });
+
+    // Disconnect handling moved here so it's with game lifecycle handlers
+    socket.on("disconnect", () => {
+      try {
+        try {
+          context.removeFromPlayQueueBySocket &&
+            context.removeFromPlayQueueBySocket(socket.id);
+        } catch (e) {}
+      } catch (e) {}
+
+      if (socket.user && socket.user.id) {
+        try {
+          removeOnlineSocketForUser(socket.user.id, socket.id);
+        } catch (e) {}
+      }
+
+      Object.keys(rooms).forEach((rId) => {
+        const room = rooms[rId];
+        const idx = room.players.findIndex((p) => p.id === socket.id);
+        if (idx !== -1) {
+          room.players[idx].online = false;
+          room.players[idx].disconnectedAt = Date.now();
+
+          room.disconnectTimers = room.disconnectTimers || {};
+          clearDisconnectTimer(room, socket.id);
+          room.disconnectTimers[socket.id] = setTimeout(async () => {
+            const p = room.players.find((pp) => pp.id === socket.id);
+            if (p && !p.online && !room.finished) {
+              const opponent = room.players.find(
+                (pp) =>
+                  (pp.color === "w" || pp.color === "b") &&
+                  pp.color !== p.color &&
+                  pp.online
+              );
+              if (opponent) {
+                room.paused = true;
+                if (room.clocks) {
+                  room.clocks.running = null;
+                  room.clocks.lastTick = null;
+                }
+                room.finished = {
+                  reason: "opponent-disconnected",
+                  winner: opponent.color,
+                  loser: p.color,
+                  message: `Player ${p.user?.username || p.id} disconnected — ${
+                    opponent.user?.username || opponent.id
+                  } wins`,
+                  finishedAt: Date.now(),
+                };
+                io.to(rId).emit("game-over", { ...room.finished });
+                clearFirstMoveTimer(room);
+                broadcastRoomState(rId);
+
+                // clear DB activeRoom for both players
+                try {
+                  await clearActiveRoomForRoom(room);
+                } catch (e) {
+                  console.error(
+                    "clearActiveRoomForRoom failed in disconnect timer",
+                    e
+                  );
+                }
+
+                try {
+                  await context.saveFinishedGame(rId);
+                } catch (err) {
+                  console.error(
+                    "saveFinishedGame error (disconnect timer):",
+                    err
+                  );
+                }
+                try {
+                  await applyCupsForFinishedRoom(rId);
+                } catch (e) {
+                  console.error(
+                    "applyCupsForFinishedRoom error (disconnect timer):",
+                    e
+                  );
+                }
+              } else {
+                // no online opponent — leave offline (no immediate finish)
+              }
+            }
+            clearDisconnectTimer(room, socket.id);
+          }, context.DISCONNECT_GRACE_MS || 60000);
+          broadcastRoomState(rId);
+        }
+      });
+      console.log("socket disconnected", socket.id);
+    });
+  }, // end registerAll
+};
