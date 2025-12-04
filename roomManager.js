@@ -539,8 +539,8 @@ function scheduleFirstMoveTimer(roomId) {
 }
 
 /* --------------------
-   Room expiration (when a room never properly starts / lacks two active players)
-   -------------------- */
+    Room expiration (when a room never properly starts / lacks two active players)
+    -------------------- */
 
 function clearRoomExpiration(roomId) {
   try {
@@ -588,8 +588,8 @@ function scheduleRoomExpiration(roomId) {
 }
 
 /* --------------------
-   ONLINE TRACKING & HELPERS
-   -------------------- */
+    ONLINE TRACKING & HELPERS
+    -------------------- */
 
 let onlineUsers = {}; // { [userIdString]: { sockets: Set, username } }
 let pendingChallenges = {}; // exported placeholder
@@ -683,8 +683,12 @@ function notifyUser(userId, event, payload) {
 }
 
 /* --------------------
-   broadcastRoomState (persist snapshot too)
-   -------------------- */
+    broadcastRoomState (persist snapshot too)
+    -------------------- */
+
+/* --------------------
+    broadcastRoomState (persist snapshot too)
+    -------------------- */
 
 function broadcastRoomState(roomId) {
   const room = rooms[roomId];
@@ -727,9 +731,9 @@ function broadcastRoomState(roomId) {
     };
   }
 
-  const msgs = (room.messages || []).slice(
-    -Math.min(MAX_CHAT_MESSAGES, room.messages.length)
-  );
+  // Normalize messages to an array so .length is safe to read
+  const msgsArr = Array.isArray(room.messages) ? room.messages : [];
+  const msgs = msgsArr.slice(-Math.min(MAX_CHAT_MESSAGES, msgsArr.length));
 
   io.to(roomId).emit("room-update", {
     players: room.players.map((p) => ({
@@ -807,8 +811,8 @@ function broadcastRoomState(roomId) {
 }
 
 /* --------------------
-   createRoom(options)
-   -------------------- */
+    createRoom(options)
+    -------------------- */
 
 /**
  * createRoom(options)
@@ -1053,11 +1057,11 @@ async function createRoom(options = {}) {
 }
 
 /* --------------------
-   Rematch helper: createRematchFrom(oldRoomId)
-   - Creates a brand-new room id, moves players into it (keeps user objects),
-   - joins available sockets and broadcasts the new room state.
-   - returns { ok: true, roomId } or { ok: false, error }.
-   -------------------- */
+    Rematch helper: createRematchFrom(oldRoomId)
+    - Creates a brand-new room id, moves players into it (keeps user objects),
+    - joins available sockets and broadcasts the new room state.
+    - returns { ok: true, roomId } or { ok: false, error }.
+    -------------------- */
 
 async function createRematchFrom(oldRoomId) {
   try {
@@ -1185,9 +1189,9 @@ async function createRematchFrom(oldRoomId) {
 }
 
 /* --------------------
-   MATCHMAKING (simple / kept)
-   (You already have fuller matchmaking in another file — kept reasonable support here)
-   -------------------- */
+    MATCHMAKING (simple / kept)
+    (You already have fuller matchmaking in another file — kept reasonable support here)
+    -------------------- */
 
 const matchmaking = {
   queueByCups: new Map(), // cupsStr -> [{ socketId, userId, username, ts, minutes }]
@@ -1383,8 +1387,8 @@ function getQueueSizes() {
 }
 
 /* --------------------
-   Utilities & exports
-   -------------------- */
+    Utilities & exports
+    -------------------- */
 
 function computeBaseUrl() {
   return (

@@ -1,31 +1,60 @@
 // backend/socket/applyCups.js
-// applyCupsForFinishedRoom moved from your file. Expects context with Game, User, ratingUtils, helpers, etc.
+// Robust, backwards-compatible applyCupsForFinishedRoom
+// Accepts either (context, roomId) OR (roomId).
+// If roomId missing, fallback: find most recent finished, unprocessed Game.
 
-async function applyCupsForFinishedRoom(context, roomId) {
+async function _applyImpl(context, roomId) {
   try {
-    if (!roomId) return;
-
     const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
     let gameDoc = null;
     const { Game, User } = context;
 
-    // 1) Try: roomId field starts with roomId
-    try {
-      const re = new RegExp("^" + esc(roomId) + "(?:-|$)");
-      gameDoc = await Game.findOne({ roomId: { $regex: re } })
-        .sort({ createdAt: -1 })
-        .exec();
-      if (gameDoc) {
-        console.log(
-          "[applyCups] found Game by roomId prefix:",
-          gameDoc._id?.toString(),
-          "roomIdField:",
-          gameDoc.roomId
-        );
+    // If no explicit roomId given, attempt a fallback: find most recent finished & unprocessed game
+    if (!roomId) {
+      try {
+        gameDoc = await Game.findOne({
+          finished: { $exists: true, $ne: null },
+          cupsProcessed: { $ne: true },
+        })
+          .sort({ createdAt: -1 })
+          .exec();
+        if (gameDoc) {
+          console.log(
+            "[applyCups] fallback: found most recent finished unprocessed Game:",
+            gameDoc._id?.toString(),
+            "roomIdField:",
+            gameDoc.roomId || gameDoc.room || gameDoc._id?.toString()
+          );
+          // derive a usable roomId string for logging/lookup
+          roomId = gameDoc.roomId || gameDoc.room || gameDoc._id?.toString();
+        } else {
+          console.warn("[applyCups] missing roomId and no fallback game found");
+          return;
+        }
+      } catch (e) {
+        console.error("[applyCups] fallback lookup failed:", e);
       }
-    } catch (e) {
-      console.error("[applyCups] lookup by roomId prefix failed:", e);
+    }
+
+    if (!gameDoc) {
+      // 1) Try: roomId field starts with roomId
+      try {
+        const re = new RegExp("^" + esc(roomId) + "(?:-|$)");
+        gameDoc = await Game.findOne({ roomId: { $regex: re } })
+          .sort({ createdAt: -1 })
+          .exec();
+        if (gameDoc) {
+          console.log(
+            "[applyCups] found Game by roomId prefix:",
+            gameDoc._id?.toString(),
+            "roomIdField:",
+            gameDoc.roomId
+          );
+        }
+      } catch (e) {
+        console.error("[applyCups] lookup by roomId prefix failed:", e);
+      }
     }
 
     if (!gameDoc) {
@@ -38,8 +67,11 @@ async function applyCupsForFinishedRoom(context, roomId) {
             "[applyCups] found Game by field 'room':",
             gameDoc._id?.toString()
           );
-      } catch (e) {}
+      } catch (e) {
+        // ignore
+      }
     }
+
     if (!gameDoc) {
       try {
         gameDoc = await Game.findOne({ "meta.roomId": roomId })
@@ -71,6 +103,7 @@ async function applyCupsForFinishedRoom(context, roomId) {
 
     if (!gameDoc) {
       try {
+        // very last resort - pick most recent game
         gameDoc = await Game.findOne({})
           .sort({ createdAt: -1 })
           .limit(1)
@@ -279,6 +312,69 @@ async function applyCupsForFinishedRoom(context, roomId) {
   } catch (err) {
     console.error("applyCupsForFinishedRoom error", err);
   }
+}
+
+// Exported function: accept either (context, roomId) or (roomId)
+async function applyCupsForFinishedRoom(a, b) {
+  // a may be context or roomId
+  // b may be roomId or undefined
+  let context = null;
+  let roomId = null;
+
+  if (a && typeof a === "object" && b) {
+    // (context, roomId)
+    context = a;
+    roomId = b;
+  } else if (a && typeof a === "string") {
+    // (roomId) only — attempt to require models directly
+    roomId = a;
+    try {
+      context = {
+        Game: require("../models/Game"),
+        User: require("../models/User"),
+        ratingUtils: (function () {
+          try {
+            return require("../ratingUtils");
+          } catch (e) {
+            return null;
+          }
+        })(),
+      };
+    } catch (e) {
+      console.error(
+        "[applyCups] failed to auto-require models when called with single arg:",
+        e
+      );
+      return;
+    }
+  } else {
+    console.warn("[applyCups] invalid args, nothing to do", { a, b });
+    return;
+  }
+
+  // ensure context has required pieces
+  context = context || {};
+  context.ratingUtils =
+    context.ratingUtils ||
+    (function () {
+      try {
+        return require("../ratingUtils");
+      } catch (e) {
+        return null;
+      }
+    })();
+
+  if (!context.Game || !context.User) {
+    try {
+      context.Game = context.Game || require("../models/Game");
+      context.User = context.User || require("../models/User");
+    } catch (e) {
+      console.error("[applyCups] cannot load Game/User models:", e);
+      return;
+    }
+  }
+
+  await _applyImpl(context, roomId);
 }
 
 module.exports = { applyCupsForFinishedRoom };

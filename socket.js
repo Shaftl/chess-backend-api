@@ -146,6 +146,63 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
     applyCupsForFinishedRoom,
   };
 
+  // --- reliable wrapper so handlers can call a single consistent API ----
+  // Use context.applyCupsForFinishedRoom(roomId)
+  context.applyCupsForFinishedRoom = async (roomId) => {
+    if (!roomId) {
+      // If caller failed to provide roomId, still call module which will attempt fallback.
+      // Log a warning for visibility.
+      console.warn(
+        "[applyCups] wrapper called without roomId — attempting fallback"
+      );
+    }
+    try {
+      // Prefer module export that accepts (context, roomId)
+      if (
+        applyCupsModule &&
+        typeof applyCupsModule.applyCupsForFinishedRoom === "function"
+      ) {
+        try {
+          return await applyCupsModule.applyCupsForFinishedRoom(
+            context,
+            roomId
+          );
+        } catch (err) {
+          // fallback to single-arg pattern
+          try {
+            return await applyCupsModule.applyCupsForFinishedRoom(roomId);
+          } catch (err2) {
+            console.error(
+              "[applyCups] module.applyCupsForFinishedRoom failed (both):",
+              err2
+            );
+          }
+        }
+      }
+
+      // If module exported directly as function
+      if (typeof applyCupsForFinishedRoom === "function") {
+        try {
+          return await applyCupsForFinishedRoom(context, roomId);
+        } catch (err) {
+          try {
+            return await applyCupsForFinishedRoom(roomId);
+          } catch (err2) {
+            console.error(
+              "[applyCups] applyCupsForFinishedRoom failed (both):",
+              err2
+            );
+          }
+        }
+      }
+
+      console.warn("[applyCups] no apply function available to call");
+    } catch (err) {
+      console.error("[applyCups] wrapper error:", err);
+    }
+  };
+  // ---------------------------------------------------------------------
+
   // start matchmaking interval (robust to different export names)
   const MATCHMAKING_INTERVAL_MS = 1000;
   const matchmakingTimer = setInterval(() => {
@@ -243,34 +300,8 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
             console.error("saveFinishedGame error (timeout):", err);
           }
           try {
-            if (typeof applyCupsForFinishedRoom === "function") {
-              // prefer applyCupsForFinishedRoom(context, roomId) if it expects context
-              try {
-                await applyCupsForFinishedRoom(context, roomId);
-              } catch (e) {
-                try {
-                  await applyCupsForFinishedRoom(roomId);
-                } catch (e2) {
-                  console.error("applyCupsForFinishedRoom failed (both):", e2);
-                }
-              }
-            } else if (
-              applyCupsModule &&
-              typeof applyCupsModule.applyCupsForFinishedRoom === "function"
-            ) {
-              try {
-                await applyCupsModule.applyCupsForFinishedRoom(context, roomId);
-              } catch (e) {
-                try {
-                  await applyCupsModule.applyCupsForFinishedRoom(roomId);
-                } catch (e2) {
-                  console.error(
-                    "applyCupsModule.applyCupsForFinishedRoom failed (both):",
-                    e2
-                  );
-                }
-              }
-            }
+            // Use the consistent wrapper that will handle either signature and fallbacks.
+            await context.applyCupsForFinishedRoom(roomId);
           } catch (e) {
             console.error("applyCupsForFinishedRoom error (timeout):", e);
           }
