@@ -12,6 +12,9 @@ const {
   isLoopbackOrLocal,
 } = require("../helpers/geo");
 
+const multer = require("multer");
+const uploadMemory = multer({ storage: multer.memoryStorage() });
+
 /* Cookie helper (same as before) */
 function makeCookieOptions(req) {
   const forwardedProto = (req.headers["x-forwarded-proto"] || "")
@@ -62,7 +65,7 @@ function absoluteAvatarUrl(req, avatarUrl) {
   if (/^https?:\/\//i.test(avatarUrl)) return avatarUrl;
   const base =
     process.env.BACKEND_BASE_URL || `${req.protocol}://${req.get("host")}`;
-  return `${base}${avatarUrl}`;
+  return `${base}${avatarUrl.startsWith("/") ? "" : "/"}${avatarUrl}`;
 }
 
 function detectClientIp(req) {
@@ -200,6 +203,8 @@ router.post("/register", async (req, res) => {
         displayName: user.displayName,
         avatarUrl: user.avatarUrl || null,
         avatarUrlAbsolute: absoluteAvatarUrl(req, user.avatarUrl),
+        backgroundUrl: user.backgroundUrl || null,
+        backgroundUrlAbsolute: absoluteAvatarUrl(req, user.backgroundUrl),
         bio: user.bio,
         country: user.country,
         cups: user.cups,
@@ -244,6 +249,8 @@ router.post("/login", async (req, res) => {
         displayName: user.displayName,
         avatarUrl: user.avatarUrl || null,
         avatarUrlAbsolute: absoluteAvatarUrl(req, user.avatarUrl),
+        backgroundUrl: user.backgroundUrl || null,
+        backgroundUrlAbsolute: absoluteAvatarUrl(req, user.backgroundUrl),
         bio: user.bio,
         country: user.country,
         cups: user.cups,
@@ -302,6 +309,8 @@ router.get("/me", authMiddleware, async (req, res) => {
       email: u.email,
       avatarUrl: u.avatarUrl || null,
       avatarUrlAbsolute: absoluteAvatarUrl(req, u.avatarUrl),
+      backgroundUrl: u.backgroundUrl || null,
+      backgroundUrlAbsolute: absoluteAvatarUrl(req, u.backgroundUrl),
       bio: u.bio,
       country: u.country,
       cups: u.cups,
@@ -318,7 +327,8 @@ router.get("/me", authMiddleware, async (req, res) => {
 
 router.put("/profile", authMiddleware, async (req, res) => {
   try {
-    const { displayName, bio, cups, country, avatarUrl, dob } = req.body;
+    const { displayName, bio, cups, country, avatarUrl, dob, backgroundUrl } =
+      req.body;
     const u = await User.findById(req.user.id);
     if (!u) return res.status(404).json({ error: "Not found" });
 
@@ -327,6 +337,13 @@ router.put("/profile", authMiddleware, async (req, res) => {
     if (typeof cups === "number") u.cups = cups;
     if (typeof country === "string") u.country = country.toUpperCase();
     if (typeof avatarUrl === "string") u.avatarUrl = avatarUrl;
+
+    // backgroundUrl may be string (set) or null (clear)
+    if (typeof backgroundUrl === "string") {
+      u.backgroundUrl = backgroundUrl;
+    } else if (backgroundUrl === null) {
+      u.backgroundUrl = null;
+    }
 
     if (dob) {
       const d = new Date(dob);
@@ -342,6 +359,8 @@ router.put("/profile", authMiddleware, async (req, res) => {
       displayName: u.displayName,
       avatarUrl: u.avatarUrl || null,
       avatarUrlAbsolute: absoluteAvatarUrl(req, u.avatarUrl),
+      backgroundUrl: u.backgroundUrl || null,
+      backgroundUrlAbsolute: absoluteAvatarUrl(req, u.backgroundUrl),
       bio: u.bio,
       country: u.country,
       cups: u.cups,

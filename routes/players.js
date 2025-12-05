@@ -121,6 +121,10 @@ router.get("/", async (req, res) => {
       avatarUrlAbsolute: u.avatarUrl
         ? absoluteAvatarUrl(req, u.avatarUrl)
         : null,
+      backgroundUrl: u.backgroundUrl || null,
+      backgroundUrlAbsolute: u.backgroundUrl
+        ? absoluteAvatarUrl(req, u.backgroundUrl)
+        : null,
       country: u.country || null,
       cups: u.cups || 0,
       createdAt: u.createdAt || null,
@@ -193,6 +197,10 @@ router.get("/:id", async (req, res) => {
       avatarUrl: user.avatarUrl || null,
       avatarUrlAbsolute: user.avatarUrl
         ? absoluteAvatarUrl(req, user.avatarUrl)
+        : null,
+      backgroundUrl: user.backgroundUrl || null,
+      backgroundUrlAbsolute: user.backgroundUrl
+        ? absoluteAvatarUrl(req, user.backgroundUrl)
         : null,
       bio: user.bio || null,
       country: user.country || null,

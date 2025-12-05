@@ -1,4 +1,4 @@
-// app.js
+// backend/app.js
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
@@ -283,26 +283,86 @@ app.post(
   }
 );
 
+// ----------------------------
+// NEW: upload background endpoint
+// field name: 'background'
+// ----------------------------
+app.post(
+  "/api/auth/upload-background",
+  restAuthMiddleware,
+  upload.single("background"),
+  async (req, res) => {
+    try {
+      const User = require("./models/User");
+      if (!req.file)
+        return res.status(400).json({ error: "No file uploaded (background)" });
+
+      const u = await User.findById(req.user.id);
+      if (!u) return res.status(404).json({ error: "User not found" });
+
+      // If ImageKit is configured, upload there first
+      if (imagekitClient) {
+        try {
+          const safeName = (req.file.originalname || "background")
+            .replace(/\s+/g, "_")
+            .replace(/[^a-zA-Z0-9_.-]/g, "");
+          const fileName = `${Date.now()}_${safeName}`;
+
+          // convert buffer to base64 string for imagekit
+          const base64 = req.file.buffer.toString("base64");
+
+          const folder =
+            process.env.IMAGEKIT_BACKGROUND_FOLDER || "/Chess-app-backgrounds";
+
+          const uploadResult = await imagekitClient.upload({
+            file: base64,
+            fileName,
+            folder,
+          });
+
+          // store absolute URL returned by ImageKit
+          u.backgroundUrl = uploadResult.url; // absolute URL
+          await u.save();
+
+          res.json({
+            backgroundUrl: u.backgroundUrl,
+            backgroundUrlAbsolute: u.backgroundUrl,
+          });
+          return;
+        } catch (ikErr) {
+          console.error(
+            "ImageKit background upload failed, falling back to local save:",
+            ikErr
+          );
+          // fallback to local save below
+        }
+      }
+
+      // FALLBACK: Save to local disk
+      const safe = (req.file.originalname || "background")
+        .replace(/\s+/g, "_")
+        .replace(/[^a-zA-Z0-9_.-]/g, "");
+      const filename = `${Date.now()}_${safe}`;
+      const outPath = path.join(UPLOADS_DIR, filename);
+
+      // write buffer to disk
+      fs.writeFileSync(outPath, req.file.buffer);
+
+      const rel = `/uploads/${filename}`;
+      u.backgroundUrl = rel;
+      await u.save();
+
+      const base =
+        process.env.BACKEND_BASE_URL ||
+        `http://localhost:${process.env.PORT || 4000}`;
+      const abs = `${base}${rel}`;
+
+      res.json({ backgroundUrl: rel, backgroundUrlAbsolute: abs });
+    } catch (err) {
+      console.error("upload-background error", err);
+      res.status(500).json({ error: "Upload failed" });
+    }
+  }
+);
+
 module.exports = app;
-
-// socket.on("webrtc-offer", ({ roomId, toSocketId, offer }) => {
-//   try {
-//     const payload = { fromSocketId: socket.id, offer };
-
-//     if (toSocketId) {
-//       relayToSocketOrUser(toSocketId, "webrtc-offer", payload);
-//       return;
-//     }
-
-//     if (roomId && rooms[roomId]) {
-//       const opponent = (rooms[roomId].players || []).find(
-//         (p) => p.id !== socket.id && (p.color === "w" || p.color === "b")
-//       );
-//       if (opponent && opponent.id) {
-//         relayToSocketOrUser(opponent.id, "webrtc-offer", payload);
-//       }
-//     }
-//   } catch (e) {
-//     console.error("webrtc-offer relay error:", e);
-//   }
-// });

@@ -1,3 +1,4 @@
+// backend/models/User.js
 const mongoose = require("mongoose");
 
 const FriendSchema = new mongoose.Schema({
@@ -26,6 +27,9 @@ const UserSchema = new mongoose.Schema({
   displayName: { type: String },
   avatarUrl: { type: String },
 
+  // NEW: user's chosen background image (absolute URL or backend path)
+  backgroundUrl: { type: String, default: null },
+
   bio: { type: String },
   country: { type: String },
   cups: { type: Number, default: 0 },
@@ -36,8 +40,6 @@ const UserSchema = new mongoose.Schema({
   incomingFriendRequests: { type: [FriendRequestSchema], default: [] },
 
   lastIp: { type: String, default: null },
-
-  // NEW: persistent single-active-room guard
 
   // NEW: user's current session id (string). Used to invalidate old JWTs when user logs in again.
   currentSession: { type: String, default: null },
