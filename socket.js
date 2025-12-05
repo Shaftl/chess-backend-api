@@ -48,11 +48,13 @@ const reservations = require("./socket/reservations"); // tryReserveActiveRoom, 
 const matchmaking = require("./socket/matchmaking"); // playQueue & attemptMatchmaking, addToPlayQueue, removeFromPlayQueue...
 const applyCupsModule = require("./socket/applyCups"); // applyCupsForFinishedRoom
 
-// your four new handler files (must export registerAll(socket, context))
+// your handler files (must export registerAll(socket, context))
 const gameHandlers = require("./socket/handlers/gameHandlers");
 const matchHandlers = require("./socket/handlers/matchHandlers");
 const friendHandlers = require("./socket/handlers/friendHandlers");
 const webrtcHandlers = require("./socket/handlers/webrtcHandlers");
+// NEW: invite handler
+const inviteHandlers = require("./socket/handlers/inviteHandlers");
 
 /* === Extract helpers / functions so they're available by name in context === */
 const {
@@ -405,6 +407,8 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         friendHandlers.registerAll(socket, context);
       if (webrtcHandlers && typeof webrtcHandlers.registerAll === "function")
         webrtcHandlers.registerAll(socket, context);
+      if (inviteHandlers && typeof inviteHandlers.registerAll === "function")
+        inviteHandlers.registerAll(socket, context);
     } catch (e) {
       console.error("Error registering socket handlers:", e);
     }

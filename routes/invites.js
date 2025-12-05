@@ -302,6 +302,38 @@ function scheduleExpiryForInvite(inv) {
 /* --------------------------- end auto-expiry --------------------------- */
 
 /**
+ * Helper: try to join all sockets for a user into a room (best-effort).
+ * Uses roomManager.getSocketsForUserId and roomManager.io when available.
+ */
+async function joinSocketsForUserIntoRoom(userId, roomId) {
+  try {
+    if (!userId || !roomId) return;
+    if (roomManager && typeof roomManager.getSocketsForUserId === "function") {
+      const sids = roomManager.getSocketsForUserId(String(userId));
+      if (Array.isArray(sids) && sids.length > 0 && roomManager.io) {
+        for (const sid of sids) {
+          try {
+            const sock = roomManager.io.sockets.sockets.get(sid);
+            if (sock) sock.join(roomId);
+          } catch (e) {}
+        }
+        return;
+      }
+    }
+    // fallback: try io.to(`user:<id>`) pattern (doesn't join sockets but can emit)
+    if (roomManager && roomManager.io) {
+      try {
+        roomManager.io.to(`user:${String(userId)}`).emit("joined-room", {
+          roomId,
+        });
+      } catch (e) {}
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+/**
  * POST /api/invites
  * body: { toUserId, minutes, colorPreference }
  * Create/persist an invite and notify recipient.
@@ -469,7 +501,9 @@ router.get("/", restAuthMiddleware, async (req, res) => {
 
 /**
  * POST /api/invites/:id/accept
- * Accept an invite addressed to current user.
+ * Accept an invite addressed to current user. Creates a room if needed, persists roomId
+ * to invite doc, joins sockets where possible and notifies both users so clients can
+ * redirect to the newly created room.
  */
 router.post("/:id/accept", restAuthMiddleware, async (req, res) => {
   try {
@@ -492,18 +526,19 @@ router.post("/:id/accept", restAuthMiddleware, async (req, res) => {
       clearScheduledExpiry(id);
     } catch (e) {}
 
+    // mark accepted locally
     inv.status = "accepted";
     inv.acceptedAt = Date.now();
 
     let createdRoomId = null;
 
-    // try to create a room using roomManager if available (best-effort)
+    // Attempt 1: use roomManager.createRoom (preferred)
     try {
       if (roomManager) {
         const createFn =
           roomManager.createRoom ||
+          roomManager.createRoomAsync ||
           roomManager.createGameRoom ||
-          roomManager.createChallengeRoom ||
           null;
 
         if (typeof createFn === "function") {
@@ -512,14 +547,21 @@ router.post("/:id/accept", restAuthMiddleware, async (req, res) => {
               minutes: inv.minutes || 5,
               colorPreference: inv.colorPreference || "random",
               userA: { id: inv.fromUserId, username: inv.fromUsername },
-              userB: { id: inv.toUserId, username: meUsername },
+              userB: {
+                id: inv.toUserId,
+                username: meUsername || inv.toUsername,
+              },
             });
+
             if (roomRes && (roomRes.roomId || roomRes.id)) {
               createdRoomId = roomRes.roomId || roomRes.id;
               inv.roomId = String(createdRoomId);
             }
           } catch (e) {
-            console.error("roomManager.createRoom failed (non-fatal)", e);
+            console.error(
+              "invites.accept: roomManager.createRoom failed (non-fatal)",
+              e
+            );
           }
         }
       }
@@ -527,21 +569,208 @@ router.post("/:id/accept", restAuthMiddleware, async (req, res) => {
       // ignore
     }
 
-    await inv.save();
+    // Attempt 2: fallback to building a minimal room in roomManager.rooms if createRoom didn't produce one
+    if (!createdRoomId) {
+      try {
+        // generate a unique id
+        const gen =
+          roomManager && typeof roomManager.generateRoomCode === "function"
+            ? roomManager.generateRoomCode
+            : (len = 8) => `R${Date.now().toString(36)}`;
 
-    // notify both parties
-    notifyUser(inv.fromUserId, "invite-updated", {
-      inviteId: inv._id?.toString(),
-      status: "accepted",
-      by: { id: meId, username: meUsername },
-      roomId: createdRoomId || null,
-    });
+        let candidate = gen(8);
+        let attempts = 0;
+        while (
+          roomManager &&
+          roomManager.rooms &&
+          roomManager.rooms[candidate] &&
+          attempts < 16
+        ) {
+          candidate = gen(8);
+          attempts++;
+        }
 
-    notifyUser(inv.toUserId, "invite-updated", {
-      inviteId: inv._id?.toString(),
-      status: "accepted",
-      roomId: createdRoomId || null,
-    });
+        // build minimal players with available user docs
+        let pA = null;
+        let pB = null;
+        try {
+          pA = await User.findById(inv.fromUserId)
+            .lean()
+            .exec()
+            .catch(() => null);
+        } catch (e) {}
+        try {
+          pB = await User.findById(inv.toUserId)
+            .lean()
+            .exec()
+            .catch(() => null);
+        } catch (e) {}
+
+        const minutes = Math.max(1, Math.floor(Number(inv.minutes || 5)));
+        const minutesMs = minutes * 60 * 1000;
+        const newRoom = {
+          players: [
+            {
+              id: inv.fromUserId,
+              user: pA || {
+                id: inv.fromUserId,
+                username: inv.fromUsername || "guest",
+              },
+              color: "w",
+              online: !!(
+                roomManager &&
+                roomManager.onlineUsers &&
+                roomManager.onlineUsers[inv.fromUserId]
+              ),
+              disconnectedAt: null,
+            },
+            {
+              id: inv.toUserId,
+              user: pB || {
+                id: inv.toUserId,
+                username: meUsername || inv.toUsername || "guest",
+              },
+              color: "b",
+              online: !!(
+                roomManager &&
+                roomManager.onlineUsers &&
+                roomManager.onlineUsers[inv.toUserId]
+              ),
+              disconnectedAt: null,
+            },
+          ],
+          moves: [],
+          chess: new (require("chess.js").Chess)(),
+          fen: null,
+          lastIndex: -1,
+          clocks: {
+            w: minutesMs,
+            b: minutesMs,
+            running: "w",
+            lastTick: Date.now(),
+          },
+          paused: false,
+          disconnectTimers: {},
+          firstMoveTimer: null,
+          pendingDrawOffer: null,
+          finished: null,
+          settings: {
+            minutes,
+            minutesMs,
+            creatorId: inv.fromUserId,
+            colorPreference: inv.colorPreference || "random",
+            createdAt: Date.now(),
+          },
+          messages: [],
+          rematch: null,
+        };
+
+        if (!roomManager) {
+          // if roomManager isn't available, still persist invite but no room creation possible
+          createdRoomId = null;
+        } else {
+          roomManager.rooms[candidate] = newRoom;
+          // schedule timers and broadcast state if functions exist
+          try {
+            if (typeof roomManager.scheduleFirstMoveTimer === "function")
+              roomManager.scheduleFirstMoveTimer(candidate);
+          } catch (e) {}
+          try {
+            if (typeof roomManager.scheduleRoomExpiration === "function")
+              roomManager.scheduleRoomExpiration(candidate);
+          } catch (e) {}
+          try {
+            if (typeof roomManager.broadcastRoomState === "function")
+              roomManager.broadcastRoomState(candidate);
+          } catch (e) {}
+          createdRoomId = candidate;
+          inv.roomId = String(createdRoomId);
+        }
+      } catch (e) {
+        console.error(
+          "invites.accept: fallback room creation failed (non-fatal)",
+          e
+        );
+      }
+    }
+
+    // Save invite now (with roomId possibly set)
+    try {
+      await inv.save();
+    } catch (e) {
+      console.warn(
+        "invites.accept: failed to save invite after creating room (non-fatal)",
+        e
+      );
+    }
+
+    // Join sockets for both users into the created room (best-effort)
+    try {
+      if (createdRoomId && roomManager) {
+        try {
+          await joinSocketsForUserIntoRoom(inv.fromUserId, createdRoomId);
+        } catch (e) {}
+        try {
+          await joinSocketsForUserIntoRoom(inv.toUserId, createdRoomId);
+        } catch (e) {}
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // Notify both parties via notifyUser and by emitting match-found for compatibility
+    try {
+      notifyUser(inv.fromUserId, "invite-updated", {
+        inviteId: inv._id?.toString(),
+        status: "accepted",
+        by: { id: meId, username: meUsername },
+        roomId: createdRoomId || null,
+      });
+    } catch (e) {}
+
+    try {
+      notifyUser(inv.toUserId, "invite-updated", {
+        inviteId: inv._id?.toString(),
+        status: "accepted",
+        roomId: createdRoomId || null,
+      });
+    } catch (e) {}
+
+    // Emit invite-accepted and match-found so clients listening for these can react
+    try {
+      notifyUser(inv.fromUserId, "invite-accepted", {
+        ok: true,
+        roomId: createdRoomId || null,
+        byUser: { id: inv.toUserId, username: meUsername || inv.toUsername },
+        minutes: inv.minutes,
+        colorPreference: inv.colorPreference,
+      });
+    } catch (e) {}
+    try {
+      notifyUser(inv.toUserId, "invite-accepted", {
+        ok: true,
+        roomId: createdRoomId || null,
+        byUser: { id: inv.toUserId, username: meUsername || inv.toUsername },
+        minutes: inv.minutes,
+        colorPreference: inv.colorPreference,
+      });
+    } catch (e) {}
+
+    // Also emit a "match-found" style event for compatibility with clients expecting it
+    try {
+      if (createdRoomId) {
+        notifyUser(inv.fromUserId, "match-found", {
+          ok: true,
+          roomId: createdRoomId,
+          message: "Invite accepted — joining room",
+        });
+        notifyUser(inv.toUserId, "match-found", {
+          ok: true,
+          roomId: createdRoomId,
+          message: "Invite accepted — joining room",
+        });
+      }
+    } catch (e) {}
 
     // Persist notification for requester and mark any related Notification rows as handled
     try {
