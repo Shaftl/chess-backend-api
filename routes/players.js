@@ -40,7 +40,7 @@ try {
     "../middleware/auth",
     "../../src/middleware/auth",
     "../src/middleware/auth",
-    "../middleware/auth",
+    "../../middleware/auth",
   ]);
   verifyToken = authModule.verifyToken || null;
 } catch (err) {
@@ -81,31 +81,6 @@ function getTokenFromReq(req) {
     }
   }
   return null;
-}
-
-/**
- * Normalize a bot id (handles URL-encoded colons and trailing socket-suffix like ":1").
- * Examples:
- *  - "bot:stockfish:TX77HP" -> "bot:stockfish:TX77HP"
- *  - "bot:stockfish:TX77HP:1" -> "bot:stockfish:TX77HP"
- *  - "bot%3Astockfish%3ATX77HP%3A1" (URL-encoded) -> "bot:stockfish:TX77HP"
- */
-function normalizeBotId(raw) {
-  if (!raw || typeof raw !== "string") return raw;
-  // decode URI component (in case Express didn't)
-  let dec = raw;
-  try {
-    dec = decodeURIComponent(raw);
-  } catch (e) {
-    dec = raw;
-  }
-  const parts = dec.split(":");
-  if (parts[0] !== "bot") return dec;
-  // keep up to bot:engine:roomId (first three segments)
-  if (parts.length >= 3) {
-    return `${parts[0]}:${parts[1]}:${parts[2]}`;
-  }
-  return dec;
 }
 
 /**
@@ -178,60 +153,20 @@ router.get("/", async (req, res) => {
 
 /**
  * GET /api/players/:id
- * Public profile by ObjectId, username, or bot id (bot:engine:roomId).
+ * Public profile by ObjectId or username.
  * Includes email only when requester is authenticated and is the same user.
  */
 router.get("/:id", async (req, res) => {
   try {
-    const rawId = req.params.id || "";
-    // decode param in case it contains URL-encoded characters
-    let decodedId = rawId;
-    try {
-      decodedId = decodeURIComponent(rawId);
-    } catch (e) {
-      decodedId = rawId;
-    }
-
-    // ---- BOT SHORT-CIRCUIT ----
-    if (String(decodedId).startsWith("bot:")) {
-      const botId = normalizeBotId(decodedId);
-      const parts = botId.split(":");
-      const engine = (parts[1] || "jsengine").toString();
-      const username =
-        engine.charAt(0).toUpperCase() + engine.slice(1).toLowerCase();
-      const displayName = username;
-
-      // Shape matches the 'result' object below for real users (keeps frontend unchanged)
-      const botResult = {
-        id: botId,
-        username,
-        displayName,
-        email: null,
-        avatarUrl: null,
-        avatarUrlAbsolute: null,
-        backgroundUrl: null,
-        backgroundUrlAbsolute: null,
-        bio: null,
-        country: null,
-        cups: 0,
-        createdAt: null,
-        lastIp: null,
-        online: true,
-        dob: null,
-        friends: [],
-      };
-      return res.json(botResult);
-    }
-    // ---- END BOT HANDLING ----
-
+    const rawId = req.params.id;
     let user = null;
 
-    if (mongoose.Types.ObjectId.isValid(decodedId)) {
-      user = await User.findById(decodedId).select("-passwordHash -__v").lean();
+    if (mongoose.Types.ObjectId.isValid(rawId)) {
+      user = await User.findById(rawId).select("-passwordHash -__v").lean();
     }
 
     if (!user) {
-      user = await User.findOne({ username: decodedId })
+      user = await User.findOne({ username: rawId })
         .select("-passwordHash -__v")
         .lean();
     }

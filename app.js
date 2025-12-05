@@ -7,7 +7,6 @@ const fs = require("fs");
 
 const authRoutes = require("./routes/auth");
 const gameRoutes = require("./routes/game");
-const botRoutes = require("./routes/bot");
 
 // NEW: rooms route
 const roomsRoutes = require("./routes/rooms");
@@ -110,8 +109,6 @@ app.use("/api/uploads", express.static(UPLOADS_DIR));
 // API routes
 app.use("/api/auth", authRoutes);
 app.use("/api/game", gameRoutes);
-app.use("/api/bot", botRoutes);
-
 app.use("/api/rooms", roomsRoutes); // <--- IMPORTANT: mount rooms endpoint
 
 const friendsRoutes = require("./routes/friends");
