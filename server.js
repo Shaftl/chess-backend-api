@@ -29,6 +29,10 @@ function startServer() {
   }
 }
 
+setInterval(() => {
+  console.log("mem:", process.memoryUsage());
+}, 30_000);
+
 /**
  * If the app (app.js) already triggered mongoose.connect(), it will emit events we can listen to.
  * If app.js didn't start the connection, we attempt to connect here using process.env.MONGODB_URI.
