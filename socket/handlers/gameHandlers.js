@@ -1717,31 +1717,192 @@ module.exports = {
       }
     });
 
-    socket.on("dequeue-match", () => {
+    // replace existing "enqueue-match" handler with this (robust multi-fallback enqueue)
+    socket.on("enqueue-match", ({ cups, minutes } = {}) => {
       try {
-        if (
-          removeFromPlayQueueBySocket &&
-          typeof removeFromPlayQueueBySocket === "function"
-        ) {
+        // capture best user info available
+        const candidateUserId = socket.user?.id ? String(socket.user.id) : null;
+        const candidateUsername =
+          socket.user?.username ||
+          (socket.handshake &&
+            socket.handshake.query &&
+            socket.handshake.query.username) ||
+          "Guest";
+
+        const cupsNum = Number(cups || 1200);
+        const minutesNum = Number(minutes || 5);
+
+        // prefer a standardized enqueueMatch API (roomManager.enqueueMatch)
+        const enqueueFn =
+          (context &&
+            typeof context.enqueueMatch === "function" &&
+            context.enqueueMatch) ||
+          (context &&
+            typeof context.addToPlayQueue === "function" &&
+            context.addToPlayQueue);
+
+        if (enqueueFn) {
+          // call enqueue and handle result if promise returned
           try {
-            removeFromPlayQueueBySocket(socket.id);
+            const res = enqueueFn({
+              socketId: socket.id,
+              userId: candidateUserId,
+              username: candidateUsername,
+              cups: cupsNum,
+              minutes: minutesNum,
+              socket, // some implementations expect the socket object
+            });
+
+            // support either sync or promise
+            Promise.resolve(res)
+              .then((r) => {
+                // If queue implementation emits to client itself, that's fine.
+                // Otherwise, inform client of queued state.
+                try {
+                  if (!r) {
+                    socket.emit("match-queued", { ok: true, queued: true });
+                  } else {
+                    // If enqueueMatch returned structured result, forward useful bits
+                    if (r.ok === false) {
+                      socket.emit("match-queue-error", {
+                        ok: false,
+                        error: r.error || "enqueue-failed",
+                      });
+                    } else {
+                      socket.emit("match-queued", {
+                        ok: true,
+                        queued: true,
+                        ...("roomId" in r ? { roomId: r.roomId } : {}),
+                      });
+                    }
+                  }
+                } catch (e) {}
+              })
+              .catch((err) => {
+                console.error("enqueue-match enqueueFn promise error:", err);
+                try {
+                  socket.emit("match-queue-error", {
+                    ok: false,
+                    error: "server-error",
+                  });
+                } catch (e) {}
+              });
+          } catch (err) {
+            console.error("enqueue-match enqueueFn call error:", err);
+            try {
+              socket.emit("match-queue-error", {
+                ok: false,
+                error: "server-error",
+              });
+            } catch (e) {}
+          }
+        } else {
+          // no queue implementation provided in context
+          try {
+            console.warn(
+              "enqueue-match: no enqueue function available in context"
+            );
+            socket.emit("match-queue-error", {
+              ok: false,
+              error: "no-queue-impl",
+            });
           } catch (e) {}
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error("enqueue-match outer error:", e);
+        try {
+          socket.emit("match-queue-error", {
+            ok: false,
+            error: "server-error",
+          });
+        } catch (err) {}
+      }
     });
 
-    socket.on("enqueue-match", ({ cups, minutes }) => {
+    // replace existing "dequeue-match" handler with this (robust multi-fallback dequeue)
+    socket.on("dequeue-match", () => {
       try {
-        if (context && typeof context.addToPlayQueue === "function") {
-          context.addToPlayQueue({
-            socketId: socket.id,
-            cups: Number(cups || 1200),
-            minutes: Number(minutes || 5),
-            socket,
-          });
+        const dequeueFn =
+          (context &&
+            typeof context.dequeueBySocketId === "function" &&
+            context.dequeueBySocketId) ||
+          (context &&
+            typeof context.removeFromPlayQueueBySocket === "function" &&
+            context.removeFromPlayQueueBySocket) ||
+          (context &&
+            typeof context.removeFromPlayQueue === "function" &&
+            context.removeFromPlayQueue);
+
+        if (dequeueFn) {
+          try {
+            const res = dequeueFn(socket.id);
+            // support promise or sync
+            Promise.resolve(res)
+              .then(() => {
+                try {
+                  socket.emit("match-dequeued", { ok: true });
+                } catch (e) {}
+              })
+              .catch((err) => {
+                console.error("dequeue-match error:", err);
+                try {
+                  socket.emit("match-dequeued", {
+                    ok: false,
+                    error: "server-error",
+                  });
+                } catch (e) {}
+              });
+          } catch (err) {
+            console.error("dequeue-match call error:", err);
+            try {
+              socket.emit("match-dequeued", {
+                ok: false,
+                error: "server-error",
+              });
+            } catch (e) {}
+          }
+        } else {
+          // no dequeue function available
+          try {
+            console.warn(
+              "dequeue-match: no dequeue function available in context"
+            );
+            socket.emit("match-dequeued", {
+              ok: false,
+              error: "no-queue-impl",
+            });
+          } catch (e) {}
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error("dequeue-match outer error:", e);
+      }
     });
+
+    // inside disconnect handler — ensure we remove from queue using the same fallbacks
+    // replace the existing removeFromPlayQueue / try block with the following:
+    try {
+      const removeFn =
+        (context &&
+          typeof context.dequeueBySocketId === "function" &&
+          context.dequeueBySocketId) ||
+        (context &&
+          typeof context.removeFromPlayQueueBySocket === "function" &&
+          context.removeFromPlayQueueBySocket) ||
+        (context &&
+          typeof context.removeFromPlayQueue === "function" &&
+          context.removeFromPlayQueue);
+
+      if (removeFn) {
+        try {
+          // call but don't block disconnect
+          Promise.resolve(removeFn(socket.id)).catch((e) => {
+            console.error("disconnect: removeFromPlayQueue error:", e);
+          });
+        } catch (e) {
+          console.error("disconnect: removeFromPlayQueue call error:", e);
+        }
+      }
+    } catch (e) {}
 
     // Disconnect: mark offline and schedule finish if needed
     socket.on("disconnect", () => {

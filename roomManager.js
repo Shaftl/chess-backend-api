@@ -1,3 +1,4 @@
+// roomManager.js
 const { Chess } = require("chess.js");
 const Game = require("./models/Game");
 const User = require("./models/User");
@@ -600,7 +601,7 @@ function scheduleRoomExpiration(roomId) {
       }
     }, ms + 1000); // small safety slack
   } catch (e) {
-    console.error("scheduleRoomExpiration error", e);
+    console.error("scheduleRoomExpiration error:", e);
   }
 }
 
@@ -731,6 +732,21 @@ function findBotInRoom(room) {
     if (isBotPlayerEntry(p)) return p;
   }
   return null;
+}
+
+function isBotRoom(roomOrId) {
+  try {
+    let room = null;
+    if (typeof roomOrId === "string") room = rooms[roomOrId];
+    else room = roomOrId;
+    if (!room) return false;
+    if (room.settings && room.settings.bot && room.settings.bot.enabled)
+      return true;
+    const botP = findBotInRoom(room);
+    return !!botP;
+  } catch (e) {
+    return false;
+  }
 }
 
 function mapLevelToDepth(level) {
@@ -1121,6 +1137,8 @@ function broadcastRoomState(roomId) {
   const room = rooms[roomId];
   if (!room || !io) return;
 
+  const isBot = isBotRoom(room);
+
   let pending = null;
   if (room.pendingDrawOffer) {
     let offerer = null;
@@ -1162,6 +1180,14 @@ function broadcastRoomState(roomId) {
   const msgsArr = Array.isArray(room.messages) ? room.messages : [];
   const msgs = msgsArr.slice(-Math.min(MAX_CHAT_MESSAGES, msgsArr.length));
 
+  // For bot rooms enforce no chat and no clocks in the emitted state
+  const emitClocks =
+    isBot || !room.clocks
+      ? null
+      : { w: room.clocks.w, b: room.clocks.b, running: room.clocks.running };
+
+  const emitMessages = isBot ? [] : msgs;
+
   io.to(roomId).emit("room-update", {
     players: room.players.map((p) => ({
       id: p.id,
@@ -1173,14 +1199,16 @@ function broadcastRoomState(roomId) {
     moves: room.moves,
     fen: room.chess ? (room.chess.fen ? room.chess.fen() : room.fen) : room.fen,
     lastIndex: room.lastIndex,
-    clocks: room.clocks
-      ? { w: room.clocks.w, b: room.clocks.b, running: room.clocks.running }
-      : null,
+    clocks: emitClocks,
     finished: room.finished || null,
     pendingDrawOffer: pending,
     settings: room.settings || null,
-    messages: msgs,
+    messages: emitMessages,
     pendingRematch: rematch,
+    // replay support: include replay index and fen if present
+    replayIndex:
+      typeof room.replayIndex !== "undefined" ? room.replayIndex : null,
+    replayFen: typeof room.replayFen !== "undefined" ? room.replayFen : null,
   });
 
   // If the room now has two active colored players and game started — cancel expiration
@@ -1219,11 +1247,16 @@ function broadcastRoomState(roomId) {
         })),
         clocks: room.clocks || null,
         settings: room.settings || null,
-        messages: msgs,
+        messages: isBot ? [] : msgs,
         finished: room.finished || null,
         rematch: room.rematch || null,
         pendingDrawOffer: pending || null,
         updatedAt: new Date(),
+        // persist replay metadata too (non-destructive)
+        replayIndex:
+          typeof room.replayIndex !== "undefined" ? room.replayIndex : null,
+        replayFen:
+          typeof room.replayFen !== "undefined" ? room.replayFen : null,
       };
 
       await RoomModel.updateOne(
@@ -1244,16 +1277,12 @@ function broadcastRoomState(roomId) {
 
 /* --------------------
     createRoom(options)
-    -------------------- */
-
-/**
- * createRoom(options)
- * Creates a new in-memory room (and persists initial snapshot via broadcastRoomState).
- * Enforces single active room per user via conditional update only when called from
- * places that should reserve (matchmaking/challenge flows).
- * - When a single user creates a room interactively (create-room socket event), avoid pre-reserving
- *   activeRoom; instead reservation happens when the user is assigned a playing seat.
- */
+    Creates a new in-memory room (and persists initial snapshot via broadcastRoomState).
+    Enforces single active room per user via conditional update only when called from
+    places that should reserve (matchmaking/challenge flows).
+    - When a single user creates a room interactively (create-room socket event), avoid pre-reserving
+      activeRoom; instead reservation happens when the user is assigned a playing seat.
+*/
 async function createRoom(options = {}) {
   try {
     const minutes = Math.max(1, Math.floor(Number(options.minutes) || 5));
@@ -1477,6 +1506,10 @@ async function createRoom(options = {}) {
       },
       messages: [],
       rematch: null,
+      // replay / undo stacks:
+      undoneMoves: [],
+      replayIndex: null,
+      replayFen: null,
     };
 
     // Respect bot options if provided (botLevel or options.bot)
@@ -1487,6 +1520,17 @@ async function createRoom(options = {}) {
           options.botLevel || (options.bot && options.bot.level) || 2
         ),
       };
+    }
+
+    // If this is a bot room: disable clocks (no time) and disable chat persistence
+    if (isBotRoom(room)) {
+      room.clocks = null; // no clock for bot games
+      // keep room.messages empty and mark in settings to signal UI (no chat)
+      room.messages = [];
+      if (!room.settings) room.settings = {};
+      room.settings.noChat = true;
+      // Do NOT set first-move timer for bot rooms (no forced first-move timeout)
+      // scheduleFirstMoveTimer will be skipped below for bot rooms
     }
 
     room.fen = room.chess ? room.chess.fen() : null;
@@ -1513,7 +1557,13 @@ async function createRoom(options = {}) {
 
     // Broadcast initial state and schedule first-move timer & expiration
     broadcastRoomState(roomId);
-    scheduleFirstMoveTimer(roomId);
+
+    // Only schedule first-move timer for non-bot rooms
+    try {
+      if (!isBotRoom(room)) scheduleFirstMoveTimer(roomId);
+    } catch (e) {}
+
+    // expiration still scheduled to allow cleanup if desired
     scheduleRoomExpiration(roomId);
 
     // If the room contains a bot and it's the bot's turn, ensure move scheduled
@@ -1622,11 +1672,18 @@ async function createRematchFrom(oldRoomId) {
       },
       messages: [],
       rematch: null,
+      undoneMoves: [],
+      replayIndex: null,
+      replayFen: null,
     };
 
     // preserve bot settings if old had them for rematch
     if (old.settings && old.settings.bot) {
       newRoom.settings.bot = { ...old.settings.bot };
+      // if bot rematch -> disable clocks and chat on new room
+      newRoom.clocks = null;
+      newRoom.messages = [];
+      newRoom.settings.noChat = true;
     }
 
     newRoom.fen = newRoom.chess ? newRoom.chess.fen() : null;
@@ -1654,7 +1711,10 @@ async function createRematchFrom(oldRoomId) {
     } catch (e) {}
 
     // schedule timers and broadcast
-    scheduleFirstMoveTimer(newRoomId);
+    // do not schedule first-move timer for bot rooms
+    try {
+      if (!isBotRoom(newRoom)) scheduleFirstMoveTimer(newRoomId);
+    } catch (e) {}
     scheduleRoomExpiration(newRoomId);
     broadcastRoomState(newRoomId);
 
@@ -1864,6 +1924,210 @@ function getQueueSizes() {
 }
 
 /* --------------------
+    Undo / Redo / Replay helpers for Bot Rooms
+    - undoLastMoveForBot(roomId, count = 1)
+    - redoLastMoveForBot(roomId, count = 1)
+    - setReplayIndex(roomId, idx)  (non-destructive navigation)
+    These are intentionally only enabled for bot rooms.
+    -------------------- */
+
+function rebuildChessFromMoves(room) {
+  const c = new Chess();
+  const moves = Array.isArray(room.moves) ? room.moves : [];
+  for (let i = 0; i < moves.length; i++) {
+    const m = moves[i];
+    try {
+      if (m && m.move) {
+        const mv = m.move;
+        c.move({
+          from: mv.from,
+          to: mv.to,
+          promotion: mv.promotion || undefined,
+        });
+      } else if (typeof m === "string") {
+        c.move(m);
+      } else if (m && m.from && m.to) {
+        c.move({
+          from: m.from,
+          to: m.to,
+          promotion: m.promotion || undefined,
+        });
+      }
+    } catch (e) {
+      // ignore illegal moves during replay reconstruction
+    }
+  }
+  return c;
+}
+
+/**
+ * undoLastMoveForBot(roomId, count = 1)
+ * - Pops up to `count` moves from room.moves (LIFO).
+ * - Stores popped moves into room.undoneMoves stack so redo is possible.
+ * - Rebuilds server chess from remaining moves and updates fen/lastIndex.
+ * - Broadcasts room state and schedules bot move if appropriate.
+ *
+ * Only allowed in bot rooms.
+ */
+function undoLastMoveForBot(roomId, count = 1) {
+  try {
+    const room = rooms[roomId];
+    if (!room) return { ok: false, error: "No such room" };
+    if (!isBotRoom(room)) return { ok: false, error: "Not a bot room" };
+    if (!Array.isArray(room.moves) || room.moves.length === 0)
+      return { ok: false, error: "No moves to undo" };
+
+    room.undoneMoves = room.undoneMoves || [];
+
+    let removed = 0;
+    for (let i = 0; i < count; i++) {
+      if (!room.moves || room.moves.length === 0) break;
+      const m = room.moves.pop();
+      room.undoneMoves.push(m);
+      removed++;
+    }
+    room.lastIndex =
+      room.moves.length > 0 ? room.moves[room.moves.length - 1].index : -1;
+
+    // rebuild chess and fen from remaining moves
+    try {
+      room.chess = rebuildChessFromMoves(room);
+      room.fen = room.chess ? room.chess.fen() : null;
+    } catch (e) {
+      room.chess = new Chess(room.fen || undefined);
+    }
+
+    // after undo, make sure room is not considered finished if it was
+    if (room.finished) {
+      room.finished = null;
+      room.paused = false;
+    }
+
+    broadcastRoomState(roomId);
+
+    // if bot is now to move, schedule a choice
+    try {
+      scheduleBotIfNeeded(roomId);
+    } catch (e) {}
+
+    return { ok: true, removed };
+  } catch (err) {
+    console.error("undoLastMoveForBot error:", err);
+    return { ok: false, error: "Server error" };
+  }
+}
+
+/**
+ * redoLastMoveForBot(roomId, count = 1)
+ * - Pops up to `count` moves from room.undoneMoves (LIFO) and appends them back to room.moves preserving original order.
+ * - Rebuilds room.chess and room.fen.
+ *
+ * Only allowed in bot rooms.
+ */
+function redoLastMoveForBot(roomId, count = 1) {
+  try {
+    const room = rooms[roomId];
+    if (!room) return { ok: false, error: "No such room" };
+    if (!isBotRoom(room)) return { ok: false, error: "Not a bot room" };
+    room.undoneMoves = room.undoneMoves || [];
+    if (!Array.isArray(room.undoneMoves) || room.undoneMoves.length === 0)
+      return { ok: false, error: "No moves to redo" };
+
+    let restored = 0;
+    for (let i = 0; i < count; i++) {
+      if (!room.undoneMoves || room.undoneMoves.length === 0) break;
+      // we popped moves from moves into undoneMoves in LIFO order.
+      // To redo the last undone, pop from undoneMoves and push onto moves.
+      const m = room.undoneMoves.pop();
+      room.moves.push(m);
+      restored++;
+    }
+
+    room.lastIndex =
+      room.moves.length > 0 ? room.moves[room.moves.length - 1].index : -1;
+
+    // rebuild chess and fen from moves
+    try {
+      room.chess = rebuildChessFromMoves(room);
+      room.fen = room.chess ? room.chess.fen() : null;
+    } catch (e) {
+      room.chess = new Chess(room.fen || undefined);
+    }
+
+    broadcastRoomState(roomId);
+
+    // if bot to move, schedule
+    try {
+      scheduleBotIfNeeded(roomId);
+    } catch (e) {}
+
+    return { ok: true, restored };
+  } catch (err) {
+    console.error("redoLastMoveForBot error:", err);
+    return { ok: false, error: "Server error" };
+  }
+}
+
+/**
+ * setReplayIndex(roomId, idx)
+ * - Non-destructive navigation through move history.
+ * - Sets room.replayIndex and room.replayFen; does NOT alter room.moves.
+ * - idx can be -1 for starting position, or 0..(moves.length-1)
+ */
+function setReplayIndex(roomId, idx) {
+  try {
+    const room = rooms[roomId];
+    if (!room) return { ok: false, error: "No such room" };
+    const moves = Array.isArray(room.moves) ? room.moves : [];
+    if (idx === null || typeof idx === "undefined") {
+      room.replayIndex = null;
+      room.replayFen = null;
+      broadcastRoomState(roomId);
+      return { ok: true, replayIndex: null, replayFen: null };
+    }
+    const target = Number(idx);
+    if (isNaN(target) || target < -1)
+      return { ok: false, error: "Invalid index" };
+    const last = moves.length - 1;
+    if (target > last) return { ok: false, error: "Index out of range" };
+
+    // build a temp chess and apply moves up to target
+    const c = new Chess();
+    if (target >= 0) {
+      for (let i = 0; i <= target; i++) {
+        const m = moves[i];
+        try {
+          if (m && m.move) {
+            c.move({
+              from: m.move.from,
+              to: m.move.to,
+              promotion: m.move.promotion || undefined,
+            });
+          } else if (typeof m === "string") {
+            c.move(m);
+          } else if (m && m.from && m.to) {
+            c.move({
+              from: m.from,
+              to: m.to,
+              promotion: m.promotion || undefined,
+            });
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+    room.replayIndex = target;
+    room.replayFen = c.fen();
+    broadcastRoomState(roomId);
+    return { ok: true, replayIndex: target, replayFen: room.replayFen };
+  } catch (err) {
+    console.error("setReplayIndex error:", err);
+    return { ok: false, error: "Server error" };
+  }
+}
+
+/* --------------------
     Utilities & exports
     -------------------- */
 
@@ -1927,4 +2191,9 @@ module.exports = {
   enqueueMatch,
   dequeueBySocketId,
   getQueueSizes,
+  // Bot / replay helpers
+  isBotRoom,
+  undoLastMoveForBot,
+  redoLastMoveForBot,
+  setReplayIndex,
 };
