@@ -52,7 +52,7 @@ if (mongoose.connection.readyState === 1) {
       useNewUrlParser: true,
       useUnifiedTopology: true,
       // you can add wtimeoutMS, serverSelectionTimeoutMS if you want explicit timeouts
-      serverSelectionTimeoutMS: 10000,
+      // serverSelectionTimeoutMS: 10000,
     })
     .then(() => {
       console.log("MongoDB connected");

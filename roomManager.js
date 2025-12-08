@@ -1,13 +1,9 @@
-// roomManager.js (final, fixed - with finishRoom centralization)
-// - robust activeRoom clearing
-// - room expiration for abandoned rooms
-// - createRematchFrom to create a new room for play-again/rematch (avoids reusing old id)
-// - NEW: finishRoom(roomId, finishedObj) centralizes finalization and calls saveFinishedGame
-
 const { Chess } = require("chess.js");
 const Game = require("./models/Game");
 const User = require("./models/User");
 const RoomModel = require("./models/Room");
+const jsChessAdapter = require("./lib/jsChessEngineAdapter");
+
 const {
   runStockfishAnalysis,
   computeDeltaForWinner,
@@ -23,6 +19,8 @@ let io = null;
 
 // expiration timers for rooms (cleanup when room doesn't start or is abandoned)
 const roomExpirationTimers = {}; // roomId -> Timeout
+// bot timers map: roomId -> Timeout (schedules next bot move)
+const botMoveTimers = {};
 
 function init(_io) {
   io = _io;
@@ -34,6 +32,15 @@ function generateRoomCode(len = 6) {
   for (let i = 0; i < len; i++)
     out += chars[Math.floor(Math.random() * chars.length)];
   return out;
+}
+
+/**
+ * Helper: detect objectid-like string (24 hex chars)
+ * Use this to avoid passing non-ObjectId values (bot ids, socket ids) into queries
+ * that target the `_id` field.
+ */
+function isObjectIdLike(v) {
+  return !!(v && typeof v === "string" && /^[a-fA-F0-9]{24}$/.test(v));
 }
 
 /**
@@ -77,6 +84,9 @@ function clearFirstMoveTimer(room) {
  * Best-effort clearing:
  * - clears the DB activeRoom/status for provided participants
  * - then clears any DB user whose activeRoom still equals this roomId
+ *
+ * NOTE: we filter participantIds to ObjectId-like strings only to avoid casting errors
+ * when bot IDs or socket IDs are present.
  */
 async function _clearActiveRoomSafety(roomId, participantIds = []) {
   try {
@@ -84,9 +94,12 @@ async function _clearActiveRoomSafety(roomId, participantIds = []) {
       ? participantIds.filter(Boolean).map(String)
       : [];
 
-    if (ids.length > 0) {
+    // filter only those that look like ObjectId strings
+    const dbIds = ids.filter((x) => isObjectIdLike(x));
+
+    if (dbIds.length > 0) {
       await User.updateMany(
-        { _id: { $in: ids } },
+        { _id: { $in: dbIds } },
         { $set: { activeRoom: null, status: "idle" } }
       ).exec();
     }
@@ -143,6 +156,7 @@ async function finishRoom(roomId, finishedObj) {
     try {
       clearFirstMoveTimer(room);
       clearRoomExpiration(roomId);
+      clearBotTimer(roomId);
     } catch (e) {}
 
     // Clear activeRoom entries for players (best-effort)
@@ -159,9 +173,12 @@ async function finishRoom(roomId, finishedObj) {
         })
         .filter(Boolean);
 
-      if (participantIds.length > 0) {
+      // Filter to ObjectId-like IDs before calling DB updates to avoid CastError when bot ids are present
+      const dbParticipantIds = participantIds.filter((x) => isObjectIdLike(x));
+
+      if (dbParticipantIds.length > 0) {
         await User.updateMany(
-          { _id: { $in: participantIds } },
+          { _id: { $in: dbParticipantIds } },
           { $set: { activeRoom: null, status: "idle" } }
         ).exec();
       }
@@ -683,8 +700,418 @@ function notifyUser(userId, event, payload) {
 }
 
 /* --------------------
-    broadcastRoomState (persist snapshot too)
+    Bot helpers (server-side AI using chess.js and negamax)
+    - schedules bot moves when room contains a bot player (id starting with 'bot:' or username 'Bot')
+    - supports simple levels (1..4) mapped to search depth
     -------------------- */
+
+function clearBotTimer(roomId) {
+  try {
+    const t = botMoveTimers[roomId];
+    if (t) {
+      clearTimeout(t);
+      delete botMoveTimers[roomId];
+    }
+  } catch (e) {}
+}
+
+function isBotPlayerEntry(p) {
+  if (!p) return false;
+  if (typeof p.id === "string" && p.id.startsWith("bot:")) return true;
+  if (p.user && typeof p.user.username === "string") {
+    const uname = String(p.user.username).toLowerCase();
+    if (uname === "bot" || uname.startsWith("bot:")) return true;
+  }
+  return false;
+}
+
+function findBotInRoom(room) {
+  if (!room || !Array.isArray(room.players)) return null;
+  for (const p of room.players) {
+    if (isBotPlayerEntry(p)) return p;
+  }
+  return null;
+}
+
+function mapLevelToDepth(level) {
+  // safe mapping; allow surprisingly shallow depths to keep CPU usage reasonable
+  const lvl = Number(level) || 2;
+  if (lvl <= 1) return 1;
+  if (lvl === 2) return 2;
+  if (lvl === 3) return 3;
+  return 4;
+}
+
+function evaluateChessMaterialAndMobility(chessInstance) {
+  // returns score from White's perspective (higher => better for white)
+  const MAT = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 200 };
+  let s = 0;
+  try {
+    const board = chessInstance.board(); // 8x8 array
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const cell = board[r][c];
+        if (!cell) continue;
+        const v = MAT[cell.type] || 0;
+        s += cell.color === "w" ? v : -v;
+      }
+    }
+    // mobility: small bonus
+    const wMoves = chessInstance.moves({
+      verbose: false,
+      legal: true,
+      color: "w",
+    }).length;
+    const bMoves = chessInstance.moves({
+      verbose: false,
+      legal: true,
+      color: "b",
+    }).length;
+    s += 0.08 * (wMoves - bMoves);
+  } catch (e) {}
+  return s;
+}
+
+// negamax with alpha-beta using chess.js instance
+function negamaxSearch(chessInstance, depth, alpha, beta, colorSign) {
+  // colorSign = 1 if evaluating from White perspective for current side; easier to treat like
+  // We'll evaluate position at leaf by using evaluateChessMaterialAndMobility and flipping sign as needed.
+  const moves = chessInstance.moves({ verbose: true });
+  if (depth === 0 || moves.length === 0) {
+    const evalv = evaluateChessMaterialAndMobility(chessInstance);
+    // return value from side-to-move perspective
+    return (chessInstance.turn() === "w" ? 1 : -1) * evalv;
+  }
+
+  // move ordering: captures first
+  moves.sort((a, b) => {
+    const va = a.captured
+      ? a.captured in { p: 1, n: 3, b: 3, r: 5, q: 9 }
+        ? { p: 1, n: 3, b: 3, r: 5, q: 9 }[a.captured]
+        : 0
+      : 0;
+    const vb = b.captured
+      ? b.captured in { p: 1, n: 3, b: 3, r: 5, q: 9 }
+        ? { p: 1, n: 3, b: 3, r: 5, q: 9 }[b.captured]
+        : 0
+      : 0;
+    return vb - va;
+  });
+
+  let best = -Infinity;
+  for (let i = 0; i < moves.length; i++) {
+    const mv = moves[i];
+    try {
+      chessInstance.move({
+        from: mv.from,
+        to: mv.to,
+        promotion: mv.promotion || "q",
+      });
+    } catch (e) {
+      continue;
+    }
+    const score = -negamaxSearch(
+      chessInstance,
+      depth - 1,
+      -beta,
+      -alpha,
+      -colorSign
+    );
+    chessInstance.undo();
+    if (score > best) best = score;
+    if (score > alpha) alpha = score;
+    if (alpha >= beta) break;
+  }
+  return best;
+}
+
+// ---------- paste/replace into roomManager.js ----------
+// Requires at top of file: const jsChessAdapter = require("../lib/jsChessEngineAdapter");
+
+// chooseBotMoveForRoom(roomId, botLevel)
+// returns normalized { from, to } or null
+async function chooseBotMoveForRoom(roomId) {
+  try {
+    const room = rooms[roomId];
+    if (!room) return null;
+    // ensure room.chess exists and we have FEN
+    try {
+      if (!room.chess)
+        room.chess = room.fen ? new Chess(room.fen) : new Chess();
+    } catch (e) {
+      room.chess = new Chess(room.fen || undefined);
+    }
+    const fen = room.chess ? room.chess.fen() : room.fen || null;
+    if (!fen) return null;
+
+    // map your bot level (if stored) to js-chess-engine level range (0..4)
+    // if you stored bot levels 1..4 map to 0..4: level-1 but clamp
+    let configuredLevel = 2;
+    try {
+      configuredLevel = Number.isFinite(+room.settings?.botLevel)
+        ? Math.max(0, Math.min(4, +room.settings.botLevel))
+        : 2;
+    } catch (e) {
+      configuredLevel = 2;
+    }
+
+    // use adapter
+    const move = await jsChessAdapter.aiMoveFromFen(fen, configuredLevel);
+    // move is { from, to } lower-case squares (e2, e4)
+    if (!move || !move.from || !move.to) return null;
+    return move;
+  } catch (err) {
+    console.error("chooseBotMoveForRoom error:", err);
+    return null;
+  }
+}
+
+// performBotMove(roomId, opts = {})
+// opts: { thinkMs } - used for optional delayed scheduling by caller
+async function performBotMove(roomId, opts = {}) {
+  try {
+    const room = rooms[roomId];
+    if (!room) return false;
+
+    // recompute chess object
+    if (!room.chess) room.chess = room.fen ? new Chess(room.fen) : new Chess();
+
+    // find bot player entry in room.players (your code used isBotPlayerEntry earlier)
+    const botPlayer = (room.players || []).find((p) => {
+      // bot players often have user id starting with 'bot:' or user object missing real id
+      const uid = p.user?.id || p.user?._id || p.id || "";
+      return (
+        String(uid).toLowerCase().startsWith("bot:") ||
+        (p.user && p.user.isBot) ||
+        (p.id && String(p.id).startsWith("bot:"))
+      );
+    });
+    if (!botPlayer) {
+      // no bot found
+      return false;
+    }
+
+    // ensure it's bot's turn
+    const currentTurn = room.chess.turn(); // 'w' or 'b'
+    if (!currentTurn) return false;
+
+    // If bot's color does not match turn -> nothing to do.
+    if (botPlayer.color !== currentTurn) return false;
+
+    // choose move via adapter
+    const chosen = await chooseBotMoveForRoom(roomId);
+    if (!chosen) {
+      // no move found — possibly game over
+      return false;
+    }
+
+    // Convert chosen move to the format used in make-move handler: { from: 'e2', to: 'e4' }
+    const move = { from: chosen.from, to: chosen.to };
+    // apply move to server chess (this mirrors make-move flow)
+    const result = room.chess.move(move);
+    if (!result) {
+      // Something illegal or mismatch, abort
+      console.warn(
+        "performBotMove: engine returned illegal move",
+        move,
+        "fen:",
+        room.chess.fen()
+      );
+      return false;
+    }
+
+    // record move
+    room.lastIndex = (room.lastIndex ?? -1) + 1;
+    const record = {
+      index: room.lastIndex,
+      move: {
+        from: move.from,
+        to: move.to,
+        promotion: result.promotion || undefined,
+      },
+    };
+    room.moves = room.moves || [];
+    room.moves.push(record);
+    room.fen = room.chess.fen();
+
+    // stop first-move timer (if any)
+    try {
+      if (typeof clearFirstMoveTimer === "function") clearFirstMoveTimer(room);
+    } catch (e) {}
+
+    // handle finished detection
+    let finishedObj = null;
+    const gameOver =
+      (typeof room.chess.game_over === "function" && room.chess.game_over()) ||
+      false;
+    const isCheckmate =
+      (typeof room.chess.in_checkmate === "function" &&
+        room.chess.in_checkmate()) ||
+      false;
+    const isStalemate =
+      (typeof room.chess.in_stalemate === "function" &&
+        room.chess.in_stalemate()) ||
+      false;
+    const isThreefold =
+      (typeof room.chess.in_threefold_repetition === "function" &&
+        room.chess.in_threefold_repetition()) ||
+      false;
+    const isInsufficient =
+      (typeof room.chess.insufficient_material === "function" &&
+        room.chess.insufficient_material()) ||
+      false;
+    const isDraw =
+      (typeof room.chess.in_draw === "function" && room.chess.in_draw()) ||
+      false;
+
+    if (isCheckmate) {
+      const winner = result.color; // 'w' or 'b'
+      const loser = winner === "w" ? "b" : "w";
+      finishedObj = {
+        reason: "checkmate",
+        winner,
+        loser,
+        message: `${winner.toUpperCase()} wins by checkmate`,
+        finishedAt: Date.now(),
+      };
+    } else if (isStalemate) {
+      finishedObj = {
+        reason: "stalemate",
+        result: "draw",
+        message: "Draw by stalemate",
+        finishedAt: Date.now(),
+      };
+    } else if (isThreefold) {
+      finishedObj = {
+        reason: "threefold-repetition",
+        result: "draw",
+        message: "Draw by threefold repetition",
+        finishedAt: Date.now(),
+      };
+    } else if (isInsufficient) {
+      finishedObj = {
+        reason: "insufficient-material",
+        result: "draw",
+        message: "Draw by insufficient material",
+        finishedAt: Date.now(),
+      };
+    } else if (isDraw || gameOver) {
+      finishedObj = {
+        reason: "draw",
+        result: "draw",
+        message: "Draw",
+        finishedAt: Date.now(),
+      };
+    }
+
+    // update clocks
+    if (!room.clocks) {
+      const minutes = room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
+      const ms = room.settings?.minutesMs || minutes * 60 * 1000;
+      room.clocks = {
+        w: ms,
+        b: ms,
+        running: room.chess.turn(),
+        lastTick: Date.now(),
+      };
+    } else {
+      if (finishedObj) {
+        room.paused = true;
+        room.clocks.running = null;
+        room.clocks.lastTick = null;
+      } else {
+        room.clocks.running = room.chess.turn();
+        room.clocks.lastTick = Date.now();
+      }
+    }
+
+    // clear draw offer if originating from bot
+    if (room.pendingDrawOffer) {
+      if (
+        room.pendingDrawOffer.fromSocketId === botPlayer.id ||
+        (botPlayer.user &&
+          room.pendingDrawOffer.fromUserId === botPlayer.user.id)
+      ) {
+        room.pendingDrawOffer = null;
+      }
+    }
+
+    // notify opponent via socket emit (match existing behavior)
+    try {
+      // roomId is string key
+      io.to(roomId).emit("opponent-move", {
+        ...record,
+        fen: room.fen,
+        clocks: room.clocks
+          ? { w: room.clocks.w, b: room.clocks.b, running: room.clocks.running }
+          : null,
+      });
+    } catch (e) {}
+
+    if (finishedObj) {
+      room.finished = finishedObj;
+      room.paused = true;
+      if (room.clocks) {
+        room.clocks.running = null;
+        room.clocks.lastTick = null;
+      }
+      io.to(roomId).emit("game-over", { ...room.finished });
+      try {
+        clearFirstMoveTimer(room);
+      } catch (e) {}
+      Object.keys(room.disconnectTimers || {}).forEach((sid) => {
+        try {
+          clearDisconnectTimer(room, sid);
+        } catch (e) {}
+      });
+      broadcastRoomState(roomId);
+
+      // persist finished game & apply cups (like make-move does)
+      try {
+        await saveFinishedGame(roomId);
+      } catch (e) {
+        console.error("performBotMove: saveFinishedGame failed", e);
+      }
+      try {
+        await applyCupsForFinishedRoom(roomId);
+      } catch (e) {
+        console.error("performBotMove: applyCupsForFinishedRoom failed", e);
+      }
+    } else {
+      broadcastRoomState(roomId);
+    }
+
+    return true;
+  } catch (err) {
+    console.error("performBotMove error:", err);
+    return false;
+  }
+}
+// ---------- end paste ----------
+
+function scheduleBotIfNeeded(roomId) {
+  try {
+    clearBotTimer(roomId);
+    const room = rooms[roomId];
+    if (!room || !room.players || !room.chess) return;
+    if (room.finished || room.paused) return;
+
+    const botP = findBotInRoom(room);
+    if (!botP) return;
+
+    // only schedule if it's bot's turn
+    const turn = room.chess.turn();
+    if (!turn) return;
+
+    if (botP.color !== turn) return;
+
+    // if schedule due to first-move timer & room.lastIndex === -1 we still schedule
+    // else schedule as normal
+    performBotMove(roomId);
+  } catch (e) {
+    console.error("scheduleBotIfNeeded error:", e);
+  }
+}
 
 /* --------------------
     broadcastRoomState (persist snapshot too)
@@ -806,6 +1233,11 @@ function broadcastRoomState(roomId) {
       ).exec();
     } catch (err) {
       console.error("broadcastRoomState: failed to persist room state:", err);
+    } finally {
+      // After persisting state, if the room contains a bot and it's the bot's turn, schedule a bot move
+      try {
+        scheduleBotIfNeeded(roomId);
+      } catch (e) {}
     }
   })();
 }
@@ -818,7 +1250,7 @@ function broadcastRoomState(roomId) {
  * createRoom(options)
  * Creates a new in-memory room (and persists initial snapshot via broadcastRoomState).
  * Enforces single active room per user via conditional update only when called from
- * places that should reserve (matchmaking / challenge / accept flows).
+ * places that should reserve (matchmaking/challenge flows).
  * - When a single user creates a room interactively (create-room socket event), avoid pre-reserving
  *   activeRoom; instead reservation happens when the user is assigned a playing seat.
  */
@@ -941,11 +1373,32 @@ async function createRoom(options = {}) {
       (userA
         ? { id: userA.id, username: userA.username }
         : { username: "guest" });
-    const pBUser =
+    let pBUser =
       acceptorUser ||
       (userB
         ? { id: userB.id, username: userB.username }
         : { username: "guest" });
+
+    // ----- NEW: If options.bot or options.botLevel provided, create a bot player -----
+    // If bot requested, replace pBUser with a bot user entry (unless userB explicitly provided and you want both)
+    if (options && (options.bot || options.botLevel)) {
+      const botLevel =
+        Number(options.botLevel || (options.bot && options.bot.level) || 2) ||
+        2;
+      const botId = `bot:${botLevel}-${Date.now()}`;
+      const botUser = {
+        id: botId,
+        username: `Bot`,
+        displayName: `Bot (Lv ${botLevel})`,
+        // no avatar by default; UI can show a Bot placeholder
+        avatarUrl: null,
+      };
+      pBUser = botUser;
+      // reflect bot settings into room.settings.bot
+      if (!options.bot) options.bot = {};
+      options.bot.level = botLevel;
+    }
+    // ------------------------------------------------------------------------------
 
     let colorPref = options.colorPreference || "random";
     let aColor = "w";
@@ -985,12 +1438,16 @@ async function createRoom(options = {}) {
       id: pBUser.id || pBUser._id || `user:${pBUser.username || "b"}`,
       user: pBUser,
       color: bColor,
-      online: !!(
-        pBUser &&
-        pBUser.id &&
-        onlineUsers[pBUser.id] &&
-        onlineUsers[pBUser.id].sockets.size > 0
-      ),
+      // if this is a bot (id starts with bot:) mark online true so UI counts it as present
+      online:
+        (typeof pBUser.id === "string" &&
+          String(pBUser.id).startsWith("bot:")) ||
+        !!(
+          pBUser &&
+          pBUser.id &&
+          onlineUsers[pBUser.id] &&
+          onlineUsers[pBUser.id].sockets.size > 0
+        ),
       disconnectedAt: null,
     });
 
@@ -1022,6 +1479,16 @@ async function createRoom(options = {}) {
       rematch: null,
     };
 
+    // Respect bot options if provided (botLevel or options.bot)
+    if (options && (options.botLevel || options.bot)) {
+      room.settings.bot = {
+        enabled: true,
+        level: Number(
+          options.botLevel || (options.bot && options.bot.level) || 2
+        ),
+      };
+    }
+
     room.fen = room.chess ? room.chess.fen() : null;
 
     rooms[roomId] = room;
@@ -1048,6 +1515,11 @@ async function createRoom(options = {}) {
     broadcastRoomState(roomId);
     scheduleFirstMoveTimer(roomId);
     scheduleRoomExpiration(roomId);
+
+    // If the room contains a bot and it's the bot's turn, ensure move scheduled
+    try {
+      scheduleBotIfNeeded(roomId);
+    } catch (e) {}
 
     return { roomId };
   } catch (err) {
@@ -1151,6 +1623,11 @@ async function createRematchFrom(oldRoomId) {
       messages: [],
       rematch: null,
     };
+
+    // preserve bot settings if old had them for rematch
+    if (old.settings && old.settings.bot) {
+      newRoom.settings.bot = { ...old.settings.bot };
+    }
 
     newRoom.fen = newRoom.chess ? newRoom.chess.fen() : null;
 

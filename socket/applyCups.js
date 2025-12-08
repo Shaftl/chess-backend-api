@@ -1,7 +1,6 @@
 // backend/socket/applyCups.js
 // Robust, backwards-compatible applyCupsForFinishedRoom
-// Accepts either (context, roomId) OR (roomId).
-// If roomId missing, fallback: find most recent finished, unprocessed Game.
+// Accepts either (context, roomId) OR (roomId). If bots or non-DB ids are present, skip cups.
 
 async function _applyImpl(context, roomId) {
   try {
@@ -26,7 +25,6 @@ async function _applyImpl(context, roomId) {
             "roomIdField:",
             gameDoc.roomId || gameDoc.room || gameDoc._id?.toString()
           );
-          // derive a usable roomId string for logging/lookup
           roomId = gameDoc.roomId || gameDoc.room || gameDoc._id?.toString();
         } else {
           console.warn("[applyCups] missing roomId and no fallback game found");
@@ -215,6 +213,11 @@ async function _applyImpl(context, roomId) {
     const loserUserId =
       loserEntry?.user?.id || loserEntry?.user?._id || loserEntry?.id || null;
 
+    // Helper: detect bot id
+    const isBotId = (id) =>
+      typeof id === "string" && id.toLowerCase().startsWith("bot:");
+
+    // If either side is a bot or a non-db id (socket id), skip cups processing.
     if (!winnerUserId || !loserUserId) {
       try {
         await Game.updateOne(
@@ -229,9 +232,55 @@ async function _applyImpl(context, roomId) {
       return;
     }
 
+    if (isBotId(winnerUserId) || isBotId(loserUserId)) {
+      try {
+        await Game.updateOne(
+          { _id: gameDoc._id },
+          { $set: { cupsProcessed: true } }
+        ).exec();
+      } catch (e) {
+        console.error(
+          "[applyCups] failed to mark cupsProcessed for bot game:",
+          e
+        );
+      }
+      console.log(
+        `[applyCups] bot involved (${
+          isBotId(winnerUserId) ? "winner" : "loser"
+        }) — skipping cups for game ${gameDoc._id?.toString()}`
+      );
+      return;
+    }
+
+    // Only attempt DB lookup for values that look like ObjectId (24 hex)
+    const looksLikeObjectId = (s) =>
+      typeof s === "string" && /^[a-fA-F0-9]{24}$/.test(s);
+
+    const candidateIds = [winnerUserId, loserUserId]
+      .map(String)
+      .filter((id) => looksLikeObjectId(id));
+
+    if (candidateIds.length < 2) {
+      // Could not find two valid DB ids — mark processed and skip
+      try {
+        await Game.updateOne(
+          { _id: gameDoc._id },
+          { $set: { cupsProcessed: true } }
+        ).exec();
+      } catch (e) {}
+      console.warn(
+        "[applyCups] one or more player ids are not valid DB ObjectIds; skipping cups. game:",
+        gameDoc._id?.toString(),
+        "ids:",
+        [winnerUserId, loserUserId]
+      );
+      return;
+    }
+
     const users = await User.find({
-      _id: { $in: [winnerUserId, loserUserId].map(String) },
+      _id: { $in: candidateIds.map(String) },
     }).exec();
+
     const winnerUser = users.find(
       (u) => String(u._id) === String(winnerUserId)
     );
@@ -352,7 +401,6 @@ async function applyCupsForFinishedRoom(a, b) {
     return;
   }
 
-  // ensure context has required pieces
   context = context || {};
   context.ratingUtils =
     context.ratingUtils ||
