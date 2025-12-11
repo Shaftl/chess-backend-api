@@ -45,6 +45,44 @@ function isObjectIdLike(v) {
 }
 
 /**
+ * Helper: escape regex for username lookup
+ */
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Try to find a DB userId from a socketId by scanning onlineUsers map.
+ * Returns userId string or null.
+ */
+function findUserIdBySocketId(socketId) {
+  try {
+    if (!socketId) return null;
+    for (const [uid, meta] of Object.entries(onlineUsers || {})) {
+      try {
+        if (
+          meta &&
+          meta.sockets &&
+          meta.sockets.has &&
+          meta.sockets.has(socketId)
+        ) {
+          return uid;
+        }
+        // some older shapes store sockets as arrays
+        if (
+          meta &&
+          Array.isArray(meta.sockets) &&
+          meta.sockets.includes(socketId)
+        ) {
+          return uid;
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
  * assignColorsForRematch(room)
  * Keeps compatibility but doesn't change global behavior that depends on it.
  */
@@ -204,324 +242,403 @@ async function finishRoom(roomId, finishedObj) {
   }
 }
 
-/**
- * saveFinishedGame(roomId)
- * Persist finished game and do rating updates, then clear DB activeRoom for participants.
- *
- * NOTE: This function has been hardened to correctly resolve winner/loser users
- * and to handle cups === 0 (nullish coalescing).
- */
+// fallback apply: atomic increment/decrement if applyCups is not available
+async function applyFallbackDelta(winnerId, loserId, delta = 12) {
+  try {
+    if (!winnerId || !loserId) {
+      console.warn("applyFallbackDelta: missing ids", winnerId, loserId);
+      return { ok: false, reason: "missing-ids" };
+    }
+    // ensure numeric delta and integer
+    const d = Number(delta) || 12;
+    // use findByIdAndUpdate with $inc to avoid race conditions
+    const beforeWinner = await User.findById(winnerId)
+      .select("cups username")
+      .lean()
+      .exec();
+    const beforeLoser = await User.findById(loserId)
+      .select("cups username")
+      .lean()
+      .exec();
+
+    const winnerUpdate = await User.findByIdAndUpdate(
+      winnerId,
+      { $inc: { cups: Math.abs(d) } },
+      { new: true, lean: true }
+    )
+      .select("cups username")
+      .exec();
+
+    const loserUpdate = await User.findByIdAndUpdate(
+      loserId,
+      { $inc: { cups: -Math.abs(d) } },
+      { new: true, lean: true }
+    )
+      .select("cups username")
+      .exec();
+
+    console.log("[applyFallbackDelta] applied fallback cups delta:", {
+      delta: d,
+      winner: {
+        id: winnerId,
+        username: winnerUpdate?.username,
+        before: beforeWinner?.cups,
+        after: winnerUpdate?.cups,
+      },
+      loser: {
+        id: loserId,
+        username: loserUpdate?.username,
+        before: beforeLoser?.cups,
+        after: loserUpdate?.cups,
+      },
+    });
+    return { ok: true, delta: d, winner: winnerUpdate, loser: loserUpdate };
+  } catch (e) {
+    console.error("[applyFallbackDelta] error:", e);
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
 async function saveFinishedGame(roomId) {
   try {
     const room = rooms[roomId];
     if (!room || !room.finished) return;
     const savedId = `${roomId}-${Date.now()}`;
 
-    const doc = new Game({
-      roomId: savedId,
-      fen: room.fen || (room.chess ? room.chess.fen() : null),
-      moves: room.moves || [],
-      players: (room.players || []).map((p) => ({
-        id: p.user?.id || p.id,
-        user: p.user || { username: p.user?.username || "guest" },
+    // build players payload (store whatever client sent so we can debug)
+    const playersPayload = (room.players || []).map((p) => {
+      const userObj = p.user || {};
+      return {
+        id: p.id || null,
+        user: {
+          id: userObj.id || userObj._id || null,
+          _id: userObj._id || null,
+          username: userObj.username || null,
+          displayName: userObj.displayName || null,
+          avatarUrl: userObj.avatarUrl || userObj.avatar || null,
+          email: userObj.email || null,
+        },
         color: p.color,
         online: !!p.online,
-      })),
+        disconnectedAt: p.disconnectedAt || null,
+      };
+    });
+
+    // small helper: test for 24-hex ObjectId string
+    const looksLikeObjectId = (v) =>
+      !!(v && typeof v === "string" && /^[a-fA-F0-9]{24}$/.test(v));
+
+    // helper: try to map a socket id to a user id using onlineUsers map (best-effort)
+    function findUserIdBySocketId_local(socketId) {
+      try {
+        if (!socketId) return null;
+        // onlineUsers shape: { userId: { sockets: Set, username } }
+        for (const [uid, meta] of Object.entries(onlineUsers || {})) {
+          try {
+            if (meta && meta.sockets) {
+              if (meta.sockets instanceof Set) {
+                if (meta.sockets.has(socketId)) return uid;
+              } else if (Array.isArray(meta.sockets)) {
+                if (meta.sockets.includes(socketId)) return uid;
+              }
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+      return null;
+    }
+
+    // robust resolver that tries many strategies to return DB _id string or null
+    async function resolveUserIdFromPlayer(p) {
+      if (!p) return null;
+      try {
+        // 1) nested user.id/_id
+        if (p.user) {
+          if (p.user.id && looksLikeObjectId(String(p.user.id)))
+            return String(p.user.id);
+          if (p.user._id && looksLikeObjectId(String(p.user._id)))
+            return String(p.user._id);
+        }
+        // 2) top-level p.id if ObjectId-like
+        if (p.id && looksLikeObjectId(String(p.id))) return String(p.id);
+
+        // 3) map p.id as socketId -> userId via onlineUsers
+        if (p.id && typeof p.id === "string") {
+          const maybe = findUserIdBySocketId_local(p.id);
+          if (maybe && looksLikeObjectId(String(maybe))) return String(maybe);
+        }
+
+        // 4) try username/displayName DB lookup (case-insensitive)
+        const uname =
+          (p.user && (p.user.username || p.user.displayName)) || null;
+        if (uname && typeof uname === "string") {
+          const esc = String(uname).trim();
+          if (esc.length > 0) {
+            try {
+              const cand = await User.findOne({
+                $or: [
+                  { username: new RegExp(`^${esc}$`, "i") },
+                  { displayName: new RegExp(`^${esc}$`, "i") },
+                  { email: new RegExp(`^${esc}$`, "i") },
+                ],
+              })
+                .select("_id username")
+                .lean()
+                .exec();
+              if (cand && cand._id) return String(cand._id);
+            } catch (e) {}
+          }
+        }
+
+        // 5) p.user.id present but not objectid-like -> still return (maybe external id)
+        if (p.user && p.user.id) return String(p.user.id);
+      } catch (e) {}
+      return null;
+    }
+
+    // --------------- Determine winner/loser color if missing ---------------
+    let winnerId = null;
+    let loserId = null;
+    let winnerColor = null;
+    try {
+      const finished = room.finished || {};
+
+      // prefer explicit winnerId/loserId already present
+      if (finished.winnerId && String(finished.winnerId).trim())
+        winnerId = String(finished.winnerId).trim();
+      if (finished.loserId && String(finished.loserId).trim())
+        loserId = String(finished.loserId).trim();
+
+      // prefer winnerColor if set
+      if (finished.winnerColor) winnerColor = finished.winnerColor;
+
+      // If neither color nor ids present, attempt to detect from chess state
+      if (!winnerColor) {
+        try {
+          // if room.chess present, run robust detection
+          let detectRes = null;
+          if (room.chess) {
+            detectRes = detectGameFinishedForRoom(room.chess);
+            if (detectRes && detectRes.winner) winnerColor = detectRes.winner;
+          } else {
+            // rebuild chess from moves
+            const tmpChess = rebuildChessFromMoves(room);
+            detectRes = detectGameFinishedForRoom(tmpChess);
+            if (detectRes && detectRes.winner) winnerColor = detectRes.winner;
+          }
+        } catch (e) {}
+      }
+
+      // Now try to resolve winner/loser ids from players using winnerColor mapping
+      if ((!winnerId || !loserId) && winnerColor) {
+        const pW = (room.players || []).find((pp) => pp.color === winnerColor);
+        const pL = (room.players || []).find(
+          (pp) => pp.color && pp.color !== winnerColor
+        );
+        if (pW && !winnerId) winnerId = await resolveUserIdFromPlayer(pW);
+        if (pL && !loserId) loserId = await resolveUserIdFromPlayer(pL);
+      }
+
+      // If still missing, attempt to resolve each player one by one
+      if (!winnerId || !loserId) {
+        for (const p of room.players || []) {
+          const resolved = await resolveUserIdFromPlayer(p);
+          if (resolved) {
+            // if winnerId not set, set it first; otherwise set loser
+            if (!winnerId) winnerId = resolved;
+            else if (!loserId && winnerId !== resolved) loserId = resolved;
+          }
+        }
+      }
+
+      // as last resort, if exactly two players, try mapping order: first -> white, second -> black
+      if (
+        (!winnerId || !loserId) &&
+        Array.isArray(room.players) &&
+        room.players.length === 2
+      ) {
+        try {
+          const p0 = room.players[0];
+          const p1 = room.players[1];
+          if (!winnerId) winnerId = await resolveUserIdFromPlayer(p0);
+          if (!loserId) loserId = await resolveUserIdFromPlayer(p1);
+          // if we accidentally assigned same id to both, clear loser to let fallback handle it
+          if (winnerId && loserId && winnerId === loserId) loserId = null;
+        } catch (e) {}
+      }
+    } catch (e) {
+      console.error("saveFinishedGame winner/loser resolution error:", e);
+    }
+
+    // Compose finishedToSave (embed any resolved ids/colors)
+    const finishedToSave = {
+      ...(room.finished || {}),
+      winnerId: winnerId || null,
+      loserId: loserId || null,
+      winnerColor:
+        winnerColor || (room.finished && room.finished.winnerColor) || null,
+    };
+
+    // Persist Game doc
+    const doc = new Game({
+      roomId: savedId,
+      fen:
+        room.fen ||
+        (room.chess ? (room.chess.fen ? room.chess.fen() : null) : null),
+      moves: room.moves || [],
+      players: playersPayload,
       clocks: room.clocks
         ? { w: room.clocks.w, b: room.clocks.b, running: room.clocks.running }
         : null,
       messages: room.messages || [],
-      createdAt: room.finished.finishedAt
-        ? new Date(room.finished.finishedAt)
-        : new Date(),
+      finished: finishedToSave || null,
+      createdAt:
+        room.finished && room.finished.finishedAt
+          ? new Date(room.finished.finishedAt)
+          : new Date(),
     });
     await doc.save();
     console.log("Saved finished game to Mongo:", savedId);
-  } catch (err) {
-    console.error("Error saving finished game:", err);
-  }
 
-  // Cups / rating update (best-effort)
-  try {
-    const room = rooms[roomId];
-    if (!room || !room.finished) return;
-    const finished = room.finished || {};
-
-    // helper: detect objectid-like string
-    const looksLikeObjectId = (v) =>
-      !!(v && typeof v === "string" && /^[a-fA-F0-9]{24}$/.test(v));
-
-    // More robust player -> user id resolution
-    function playerUserId(p) {
-      if (!p) return null;
-      // prefer nested user id / _id
-      if (p.user) {
-        if (p.user.id) return String(p.user.id);
-        if (p.user._id) return String(p.user._id);
-      }
-      // fallback to top-level id if it's an ObjectId-like string
-      if (p.id && typeof p.id === "string" && looksLikeObjectId(p.id))
-        return String(p.id);
-      // otherwise no reliable DB id
-      return null;
-    }
-
-    let winnerId = null;
-    let loserId = null;
-
-    if (finished.winnerId) winnerId = String(finished.winnerId);
-    if (finished.loserId) loserId = String(finished.loserId);
-
-    if (!winnerId && finished.winnerColor) {
-      const p = (room.players || []).find(
-        (x) => String(x.color) === String(finished.winnerColor)
+    // If we still don't have winner/loser ids, log full debug payload and leave for retry
+    if (!doc.finished || (!doc.finished.winnerId && !doc.finished.loserId)) {
+      console.warn(
+        "[saveFinishedGame] winner/loser NOT resolved when saving. Saved players payload:",
+        {
+          gameId: String(doc._id),
+          players: playersPayload,
+          finished: doc.finished,
+        }
       );
-      winnerId = playerUserId(p);
-    }
-    if (!winnerId && finished.winner) {
-      const w = String(finished.winner).toLowerCase();
-      if (w === "w" || w === "b") {
-        const p = (room.players || []).find((x) => x.color === w);
-        winnerId = playerUserId(p);
-      } else {
-        // finished.winner may be a username; attempt to find player by username
-        const p = (room.players || []).find((pp) => {
-          const uname =
-            (pp.user && (pp.user.username || pp.user.displayName)) ||
-            pp.username;
-          return (
-            uname &&
-            String(uname).toLowerCase() ===
-              String(finished.winner).toLowerCase()
-          );
-        });
-        if (p)
-          winnerId =
-            playerUserId(p) || (p.user && (p.user.id || p.user._id)) || null;
-      }
+    } else {
+      console.log("[saveFinishedGame] resolved winner/loser saved on Game:", {
+        gameId: String(doc._id),
+        winnerId: doc.finished.winnerId,
+        loserId: doc.finished.loserId,
+      });
     }
 
-    if (!winnerId && finished.result) {
-      const rs = String(finished.result).toLowerCase();
-      if (
-        rs === "draw" ||
-        rs === "tie" ||
-        rs === "stalemate" ||
-        rs.includes("draw")
-      ) {
-        // draw, skip rating changes
-      }
-      if (finished.loserId || finished.loser) {
-        const lid = finished.loserId || finished.loser;
-        const loserCandidate = (room.players || []).find((p) => {
-          const uid =
-            (p.user && (p.user.id || p.user._id)) ||
-            p.id ||
-            (p.user && p.user._id) ||
-            null;
-          const uname =
-            (p.user && (p.user.username || p.user.displayName)) || p.username;
-          return uid === String(lid) || String(uname) === String(lid);
-        });
-        if (loserCandidate) {
-          loserId =
-            (loserCandidate.user &&
-              (loserCandidate.user.id || loserCandidate.user._id)) ||
-            loserCandidate.id ||
-            null;
-          const winnerCandidate = (room.players || []).find((p) => {
-            const uid = (p.user && (p.user.id || p.user._id)) || p.id || null;
-            return uid && String(uid) !== String(loserId);
-          });
-          winnerId =
-            (winnerCandidate &&
-              ((winnerCandidate.user &&
-                (winnerCandidate.user.id || winnerCandidate.user._id)) ||
-                winnerCandidate.id)) ||
-            null;
+    // Attempt to call existing applyCups module first (many projects expose this)
+    try {
+      // try a few common paths
+      const tryPaths = [
+        path.join(__dirname, "socket", "applyCups"),
+        path.join(__dirname, "applyCups"),
+        path.join(__dirname, "..", "socket", "applyCups"),
+        path.join(__dirname, "..", "src", "socket", "applyCups"),
+        path.join(process.cwd(), "backend", "socket", "applyCups"),
+        path.join(process.cwd(), "socket", "applyCups"),
+        "./socket/applyCups",
+        "./applyCups",
+      ];
+      let applyCupsModule = null;
+      for (const p of tryPaths) {
+        try {
+          applyCupsModule = require(p);
+          if (applyCupsModule) break;
+        } catch (e) {
+          // ignore
         }
       }
-    }
 
-    // At this point winnerId/loserId may be a DB _id-string or may be null.
-    // Try to load the users robustly: if we have an ObjectId-like string, use findById,
-    // otherwise try a username lookup (in case id was passed as username).
-    let winnerUser = null;
-    let loserUser = null;
+      if (applyCupsModule) {
+        // find a callable function
+        let applyCupsFunc = null;
+        if (typeof applyCupsModule === "function")
+          applyCupsFunc = applyCupsModule;
+        else if (typeof applyCupsModule.applyCupsForFinishedRoom === "function")
+          applyCupsFunc = applyCupsModule.applyCupsForFinishedRoom;
+        else if (typeof applyCupsModule.default === "function")
+          applyCupsFunc = applyCupsModule.default;
 
-    if (winnerId) {
-      if (looksLikeObjectId(winnerId)) {
-        winnerUser = await User.findById(String(winnerId))
-          .select("cups")
-          .exec();
+        if (!applyCupsFunc) {
+          console.warn(
+            "[saveFinishedGame] applyCups module found but no callable exported function"
+          );
+        } else {
+          // try calling it with common signatures: (ctx, gameId) or (gameId)
+          let calledRes = null;
+          try {
+            const ctx = {
+              Game,
+              User,
+              ratingUtils:
+                typeof ratingUtils !== "undefined" ? ratingUtils : null,
+              io,
+              notifyUser:
+                typeof notifyUser === "function" ? notifyUser : () => {},
+            };
+            calledRes = await applyCupsFunc(ctx, doc._id);
+          } catch (e) {
+            try {
+              calledRes = await applyCupsFunc(doc._id);
+            } catch (err) {
+              console.error("[saveFinishedGame] applyCups call error:", err);
+              calledRes = null;
+            }
+          }
+          if (calledRes && calledRes.ok) {
+            console.log("[saveFinishedGame] applyCups reported ok:", calledRes);
+          } else if (calledRes) {
+            console.warn(
+              "[saveFinishedGame] applyCups reported non-ok:",
+              calledRes
+            );
+          } else {
+            console.warn("[saveFinishedGame] applyCups returned falsy result");
+          }
+          return;
+        }
       } else {
-        // try lookup by username/displayName
-        winnerUser = await User.findOne({
-          $or: [{ username: winnerId }, { displayName: winnerId }],
-        })
-          .select("cups")
-          .exec();
+        console.warn("[saveFinishedGame] could not locate applyCups module");
       }
-    }
-
-    if (loserId) {
-      if (looksLikeObjectId(loserId)) {
-        loserUser = await User.findById(String(loserId)).select("cups").exec();
-      } else {
-        loserUser = await User.findOne({
-          $or: [{ username: loserId }, { displayName: loserId }],
-        })
-          .select("cups")
-          .exec();
-      }
-    }
-
-    // As a last-ditch: if winnerUser/loserUser still null, try to derive them from room.players by matching username
-    if (!winnerUser) {
-      const p = (room.players || []).find((pp) => {
-        const uname =
-          (pp.user && (pp.user.username || pp.user.displayName)) || pp.username;
-        return (
-          uname &&
-          String(uname).toLowerCase() ===
-            String(finished.winner || "").toLowerCase()
-        );
-      });
-      if (p && p.user && (p.user.id || p.user._id)) {
-        try {
-          winnerUser = await User.findById(String(p.user.id || p.user._id))
-            .select("cups")
-            .exec();
-        } catch (e) {}
-      }
-    }
-
-    if (!loserUser) {
-      const p = (room.players || []).find((pp) => {
-        const uname =
-          (pp.user && (pp.user.username || pp.user.displayName)) || pp.username;
-        return (
-          uname &&
-          String(uname).toLowerCase() ===
-            String(finished.loser || "").toLowerCase()
-        );
-      });
-      if (p && p.user && (p.user.id || p.user._id)) {
-        try {
-          loserUser = await User.findById(String(p.user.id || p.user._id))
-            .select("cups")
-            .exec();
-        } catch (e) {}
-      }
-    }
-
-    // Use nullish coalescing so that cups === 0 is treated as a valid rating (not replaced by 1200)
-    const winnerRating = Number(winnerUser?.cups ?? 1200);
-    const loserRating = Number(loserUser?.cups ?? 1200);
-
-    const movesRaw = Array.isArray(room.moves) ? room.moves : [];
-    const toUci = (m) => {
-      if (!m) return null;
-      if (typeof m === "string") return m;
-      if (m.move && typeof m.move === "string") return m.move;
-      if (m.move && m.move.from && m.move.to)
-        return `${m.move.from}${m.move.to}${m.move.promotion || ""}`;
-      if (m.from && m.to) return `${m.from}${m.to}${m.promotion || ""}`;
-      return null;
-    };
-    const movesUci = movesRaw.map(toUci).filter(Boolean);
-
-    let analysis = null;
-    try {
-      analysis = await runStockfishAnalysis(
-        movesUci,
-        parseInt(process.env.STOCKFISH_DEPTH || "12", 10),
-        parseInt(process.env.STOCKFISH_TIMEOUT || "4000", 10)
+    } catch (e) {
+      console.error(
+        "[saveFinishedGame] error attempting to call applyCups (ignored):",
+        e
       );
-    } catch (e) {
-      analysis = null;
     }
 
-    let winnerColor = null;
-    const pWinner = (room.players || []).find((p) => {
-      const uid =
-        (p.user && (p.user.id || p.user._id)) ||
-        p.id ||
-        (p.user && p.user._id) ||
-        null;
-      return uid && String(uid) === String(winnerId);
-    });
-    if (pWinner && pWinner.color) winnerColor = String(pWinner.color);
-
-    let winnerACPL = 200,
-      loserACPL = 200,
-      maxSwingCp = 0;
-    if (analysis) {
-      if (winnerColor === "w") {
-        winnerACPL = analysis.acplWhite || 200;
-        loserACPL = analysis.acplBlack || 200;
-      } else {
-        winnerACPL = analysis.acplBlack || 200;
-        loserACPL = analysis.acplWhite || 200;
-      }
-      maxSwingCp = analysis.maxSwingCp || 0;
-    }
-
-    let delta = 10;
-    try {
-      if (analysis && winnerUser && loserUser) {
-        delta = computeDeltaForWinner(
-          winnerRating,
-          loserRating,
-          winnerACPL,
-          loserACPL,
-          maxSwingCp,
-          /*gamesplayed*/ 50
-        );
-      } else if (winnerUser && loserUser) {
-        const expected =
-          1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
-        const K = 20;
-        delta = Math.max(1, Math.round(K * (1 - expected)));
-        if (delta < 10) delta = 10;
-      } else {
-        delta = 10;
-      }
-    } catch (e) {
-      delta = 10;
-    }
-
-    async function adjustUserCupsAndNotify(uid, newValue, deltaValue) {
+    // FINAL fallback: if we have resolved winnerId & loserId, apply a deterministic delta (ensures winner ++, loser --)
+    if (finishedToSave.winnerId && finishedToSave.loserId) {
       try {
-        const u = await User.findById(String(uid)).exec();
-        if (!u) return;
-        u.cups = Number(newValue);
-        await u.save();
-        try {
-          notifyUser(String(uid), "cups-changed", {
-            cups: u.cups,
-            delta: Number(deltaValue),
-          });
-        } catch (e) {}
-      } catch (err) {
-        console.error("adjustUserCupsAndNotify error for", uid, err);
+        // You wanted Stockfish rating alternative earlier — if you have ratingUtils ready you can compute delta:
+        // const delta = typeof computeDeltaForWinner === "function" ? computeDeltaForWinner(...) : 12;
+        // For now, use fixed 12 to guarantee deterministic behavior (always increase winner, decrease loser)
+        const fallbackDelta = 12;
+        const res = await applyFallbackDelta(
+          finishedToSave.winnerId,
+          finishedToSave.loserId,
+          fallbackDelta
+        );
+        if (res && res.ok) {
+          console.log("[saveFinishedGame] applied fallback cups update:", res);
+        } else {
+          console.warn(
+            "[saveFinishedGame] fallback cups update reported non-ok:",
+            res
+          );
+        }
+      } catch (e) {
+        console.error(
+          "[saveFinishedGame] fallback delta application failed:",
+          e
+        );
       }
+      return;
     }
 
-    if (winnerUser && loserUser) {
-      const newWinner = Math.max(
-        0,
-        Number(winnerUser.cups ?? 0) + Number(delta)
-      );
-      await adjustUserCupsAndNotify(winnerUser._id, newWinner, delta);
-
-      const newLoser = Math.max(0, Number(loserUser.cups ?? 0) - Number(delta));
-      await adjustUserCupsAndNotify(loserUser._id, newLoser, -delta);
-    }
-
-    // no further active-room clearing here; finishRoom already attempted it
+    // if we reach here, we could not resolve both users — leave the saved game for async/cron retry/inspection
+    console.warn(
+      "[saveFinishedGame] could not resolve both users — leaving unprocessed for retry",
+      {
+        gameId: String(doc._id),
+        winnerEntry: finishedToSave.winnerId || null,
+        loserEntry: finishedToSave.loserId || null,
+      }
+    );
   } catch (err) {
-    console.error("cups update error after saving game:", err);
+    console.error("Error saving finished game:", err);
   }
 }
 
@@ -844,6 +961,142 @@ function negamaxSearch(chessInstance, depth, alpha, beta, colorSign) {
 // ---------- paste/replace into roomManager.js ----------
 // Requires at top of file: const jsChessAdapter = require("../lib/jsChessEngineAdapter");
 
+// Robust detectGameFinished helper for roomManager (same logic as gameHandlers)
+function _safeCallRM(chess, ...names) {
+  for (const n of names) {
+    if (!chess) break;
+    if (typeof chess[n] === "function") {
+      try {
+        return chess[n]();
+      } catch (e) {}
+    }
+  }
+  return null;
+}
+
+function detectGameFinishedForRoom(chess, lastMoveResult = null) {
+  try {
+    if (!chess) return null;
+    const now = Date.now();
+
+    if (_safeCallRM(chess, "in_checkmate", "inCheckmate", "isCheckmate")) {
+      const moverColor = lastMoveResult?.color || null;
+      const winner =
+        moverColor ||
+        (typeof chess.turn === "function"
+          ? chess.turn() === "w"
+            ? "b"
+            : "w"
+          : "w");
+      const loser = winner === "w" ? "b" : "w";
+      return {
+        reason: "checkmate",
+        winner,
+        loser,
+        message: `${winner.toUpperCase()} wins by checkmate`,
+        finishedAt: now,
+      };
+    }
+
+    if (_safeCallRM(chess, "in_stalemate", "inStalemate", "isStalemate")) {
+      return {
+        reason: "stalemate",
+        result: "draw",
+        message: "Draw by stalemate",
+        finishedAt: now,
+      };
+    }
+
+    if (
+      _safeCallRM(
+        chess,
+        "in_threefold_repetition",
+        "inThreefoldRepetition",
+        "isThreefold"
+      )
+    ) {
+      return {
+        reason: "threefold-repetition",
+        result: "draw",
+        message: "Draw by threefold repetition",
+        finishedAt: now,
+      };
+    }
+
+    if (
+      _safeCallRM(
+        chess,
+        "insufficient_material",
+        "insufficientMaterial",
+        "isInsufficientMaterial"
+      )
+    ) {
+      return {
+        reason: "insufficient-material",
+        result: "draw",
+        message: "Draw by insufficient material",
+        finishedAt: now,
+      };
+    }
+
+    if (_safeCallRM(chess, "in_draw", "inDraw", "isDraw")) {
+      return {
+        reason: "draw",
+        result: "draw",
+        message: "Draw",
+        finishedAt: now,
+      };
+    }
+
+    // fallback canonical rule
+    let moves = [];
+    try {
+      moves =
+        typeof chess.moves === "function" ? chess.moves({ verbose: true }) : [];
+    } catch (e) {
+      try {
+        moves = chess.moves ? chess.moves() : [];
+      } catch {
+        moves = [];
+      }
+    }
+
+    if (!Array.isArray(moves) || moves.length === 0) {
+      const inCheck = _safeCallRM(chess, "in_check", "inCheck") || false;
+      if (inCheck) {
+        const moverColor = lastMoveResult?.color || null;
+        const winner =
+          moverColor ||
+          (typeof chess.turn === "function"
+            ? chess.turn() === "w"
+              ? "b"
+              : "w"
+            : "w");
+        const loser = winner === "w" ? "b" : "w";
+        return {
+          reason: "checkmate",
+          winner,
+          loser,
+          message: `${winner.toUpperCase()} wins by checkmate`,
+          finishedAt: now,
+        };
+      } else {
+        return {
+          reason: "stalemate",
+          result: "draw",
+          message: "Draw by stalemate",
+          finishedAt: now,
+        };
+      }
+    }
+
+    return null;
+  } catch (e) {
+    console.error("detectGameFinishedForRoom error:", e);
+    return null;
+  }
+}
+
 // chooseBotMoveForRoom(roomId, botLevel)
 // returns normalized { from, to } or null
 async function chooseBotMoveForRoom(roomId) {
@@ -955,70 +1208,8 @@ async function performBotMove(roomId, opts = {}) {
       if (typeof clearFirstMoveTimer === "function") clearFirstMoveTimer(room);
     } catch (e) {}
 
-    // handle finished detection
-    let finishedObj = null;
-    const gameOver =
-      (typeof room.chess.game_over === "function" && room.chess.game_over()) ||
-      false;
-    const isCheckmate =
-      (typeof room.chess.in_checkmate === "function" &&
-        room.chess.in_checkmate()) ||
-      false;
-    const isStalemate =
-      (typeof room.chess.in_stalemate === "function" &&
-        room.chess.in_stalemate()) ||
-      false;
-    const isThreefold =
-      (typeof room.chess.in_threefold_repetition === "function" &&
-        room.chess.in_threefold_repetition()) ||
-      false;
-    const isInsufficient =
-      (typeof room.chess.insufficient_material === "function" &&
-        room.chess.insufficient_material()) ||
-      false;
-    const isDraw =
-      (typeof room.chess.in_draw === "function" && room.chess.in_draw()) ||
-      false;
-
-    if (isCheckmate) {
-      const winner = result.color; // 'w' or 'b'
-      const loser = winner === "w" ? "b" : "w";
-      finishedObj = {
-        reason: "checkmate",
-        winner,
-        loser,
-        message: `${winner.toUpperCase()} wins by checkmate`,
-        finishedAt: Date.now(),
-      };
-    } else if (isStalemate) {
-      finishedObj = {
-        reason: "stalemate",
-        result: "draw",
-        message: "Draw by stalemate",
-        finishedAt: Date.now(),
-      };
-    } else if (isThreefold) {
-      finishedObj = {
-        reason: "threefold-repetition",
-        result: "draw",
-        message: "Draw by threefold repetition",
-        finishedAt: Date.now(),
-      };
-    } else if (isInsufficient) {
-      finishedObj = {
-        reason: "insufficient-material",
-        result: "draw",
-        message: "Draw by insufficient material",
-        finishedAt: Date.now(),
-      };
-    } else if (isDraw || gameOver) {
-      finishedObj = {
-        reason: "draw",
-        result: "draw",
-        message: "Draw",
-        finishedAt: Date.now(),
-      };
-    }
+    // unified finished detection using the robust helper
+    const finishedObj = detectGameFinishedForRoom(room.chess, result);
 
     // update clocks
     if (!room.clocks) {

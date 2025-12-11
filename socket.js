@@ -88,9 +88,21 @@ const { applyCupsForFinishedRoom } = applyCupsModule || {};
 /* Exported initSockets                                                */
 /* ------------------------------------------------------------------ */
 function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
+  // allow either a string or an array of origins
+  const corsOrigin = CLIENT_ORIGIN;
+
   const io = new Server(server, {
-    cors: { origin: CLIENT_ORIGIN, credentials: true },
+    cors: { origin: corsOrigin, credentials: true },
   });
+
+  // log for visibility
+  try {
+    if (Array.isArray(corsOrigin)) {
+      console.log("Socket.IO allowed origins:", corsOrigin.join(", "));
+    } else {
+      console.log("Socket.IO allowed origin:", corsOrigin);
+    }
+  } catch (e) {}
 
   // initialize roomManager with io
   roomManager.init(io);
@@ -312,6 +324,18 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
     });
   }, 500);
 
+  // helper: emit presence-changed to all clients (safe, client expects this)
+  function emitPresenceChanged(userId) {
+    try {
+      if (!userId) return;
+      const sockets = getSocketsForUserId ? getSocketsForUserId(userId) : null;
+      const online = sockets && Array.isArray(sockets) && sockets.length > 0;
+      io.emit("presence-changed", { userId, online, sockets });
+    } catch (e) {
+      console.warn("emitPresenceChanged error:", e);
+    }
+  }
+
   // auth middleware (kept original logic) — uses helpers.verifyToken & addOnlineSocketForUser
   io.use(async (socket, next) => {
     let token = socket.handshake?.auth?.token || null;
@@ -360,13 +384,37 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
           cups:
             typeof userDoc.cups !== "undefined" ? Number(userDoc.cups) : null,
         };
-        addOnlineSocketForUser(socket.user.id, socket.id, socket.user.username);
+
+        // track online socket for this user
+        try {
+          addOnlineSocketForUser(
+            socket.user.id,
+            socket.id,
+            socket.user.username
+          );
+          // immediately let everyone know this user is online
+          emitPresenceChanged(socket.user.id);
+        } catch (e) {
+          console.warn("addOnlineSocketForUser (middleware) failed:", e);
+        }
       } else {
         socket.user = {
           id: normId(decoded.id),
           username: decoded.username || "unknown",
         };
-        addOnlineSocketForUser(socket.user.id, socket.id, socket.user.username);
+        try {
+          addOnlineSocketForUser(
+            socket.user.id,
+            socket.id,
+            socket.user.username
+          );
+          emitPresenceChanged(socket.user.id);
+        } catch (e) {
+          console.warn(
+            "addOnlineSocketForUser (middleware anonymous) failed:",
+            e
+          );
+        }
       }
     } catch (err) {
       console.warn("Socket auth parse failed:", err?.message || err);
@@ -386,7 +434,12 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
         id: normId(decodedUser.id),
         username: decodedUser.username,
       };
-      addOnlineSocketForUser(socket.user.id, socket.id, socket.user.username);
+      try {
+        addOnlineSocketForUser(socket.user.id, socket.id, socket.user.username);
+        emitPresenceChanged(socket.user.id);
+      } catch (e) {
+        console.warn("addOnlineSocketForUser (connection) failed:", e);
+      }
     } else {
       socket.user = socket.user || null;
     }
@@ -413,7 +466,91 @@ function initSockets(server, CLIENT_ORIGIN = "https://chess-alyas.vercel.app") {
       console.error("Error registering socket handlers:", e);
     }
 
-    // (disconnect logic, webrtc, etc. should live inside the registered handlers)
+    // --- Presence & disconnect helpers for this socket ---
+    // client fires this when page is unloading; best-effort to remove socket immediately
+    socket.on("client-unload", (payload) => {
+      try {
+        if (socket.user && socket.user.id) {
+          removeOnlineSocketForUser(socket.user.id, socket.id);
+          emitPresenceChanged(socket.user.id);
+        }
+      } catch (e) {
+        console.warn("client-unload handler failed:", e);
+      }
+    });
+
+    // explicit logout from client (e.g. logout button)
+    socket.on("client-logout", (payload) => {
+      try {
+        if (socket.user && socket.user.id) {
+          removeOnlineSocketForUser(socket.user.id, socket.id);
+          emitPresenceChanged(socket.user.id);
+        }
+        // optionally leave rooms, etc.
+        try {
+          socket.leaveAll && socket.leaveAll();
+        } catch (e) {}
+      } catch (e) {
+        console.warn("client-logout handler failed:", e);
+      }
+    });
+
+    // lightweight heartbeat: server may update last-seen or consider socket healthy
+    socket.on("presence-heartbeat", (payload) => {
+      try {
+        // payload may be used to update lastSeen somewhere in roomManager if implemented
+        if (
+          socket.user &&
+          socket.user.id &&
+          typeof roomManager.markSocketHeartbeat === "function"
+        ) {
+          try {
+            roomManager.markSocketHeartbeat(
+              socket.user.id,
+              socket.id,
+              Date.now()
+            );
+          } catch (e) {}
+        }
+        // for visibility, emit presence-changed for this user (sender)
+        if (socket.user && socket.user.id) {
+          emitPresenceChanged(socket.user.id);
+        }
+      } catch (e) {}
+    });
+
+    // when socket is in the process of disconnecting
+    socket.on("disconnecting", (reason) => {
+      try {
+        if (socket.user && socket.user.id) {
+          // remove this socket from online tracking immediately
+          removeOnlineSocketForUser(socket.user.id, socket.id);
+          // broadcast so clients update quickly
+          emitPresenceChanged(socket.user.id);
+        }
+      } catch (e) {
+        console.warn("disconnecting handler failed:", e);
+      }
+    });
+
+    // final disconnect event
+    socket.on("disconnect", (reason) => {
+      console.log(`socket ${socket.id} disconnected:`, reason);
+      try {
+        if (socket.user && socket.user.id) {
+          // ensure removal (idempotent)
+          try {
+            removeOnlineSocketForUser(socket.user.id, socket.id);
+          } catch (e) {}
+          emitPresenceChanged(socket.user.id);
+        }
+      } catch (e) {
+        console.warn("disconnect handler failed:", e);
+      }
+      // leave everything to other handlers to tidy up room state if needed
+    });
+
+    // (other logic, webrtc, etc. should live inside the registered handlers)
   });
 
   return io;

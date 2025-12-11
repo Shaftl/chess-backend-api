@@ -1,7 +1,3 @@
-// backend/socket/handlers/gameHandlers.js
-// Complete socket handlers file with full bot support and all other handlers.
-// Replace your existing file with this one.
-
 const { Chess } = require("chess.js");
 
 module.exports = {
@@ -40,6 +36,9 @@ module.exports = {
       MAX_CHAT_MESSAGES = 200,
       DEFAULT_MS = 5 * 60 * 1000,
       removeFromPlayQueueBySocket,
+      // fallback queue names if needed:
+      dequeueBySocketId,
+      dequeueFn,
     } = context || {};
 
     // === Bot adapter (optional) ===
@@ -63,6 +62,164 @@ module.exports = {
         return 4;
       }
       return 2;
+    }
+
+    // Robust detectGameFinished implementation
+    function _safeCall(chess, ...names) {
+      for (const n of names) {
+        if (!chess) break;
+        if (typeof chess[n] === "function") {
+          try {
+            return chess[n]();
+          } catch (e) {
+            // ignore and try next
+          }
+        }
+      }
+      return null;
+    }
+
+    function detectGameFinished(chess, lastMoveResult = null) {
+      try {
+        if (!chess) return null;
+        const now = Date.now();
+
+        // Prefer direct "is checkmate" if available
+        const checkmateFlag = _safeCall(
+          chess,
+          "in_checkmate",
+          "inCheckmate",
+          "isCheckmate"
+        );
+        if (checkmateFlag) {
+          const moverColor = lastMoveResult?.color || null;
+          const winner =
+            moverColor ||
+            (typeof chess.turn === "function"
+              ? chess.turn() === "w"
+                ? "b"
+                : "w"
+              : "w");
+          const loser = winner === "w" ? "b" : "w";
+          return {
+            reason: "checkmate",
+            winner,
+            loser,
+            message: `${winner.toUpperCase()} wins by checkmate`,
+            finishedAt: now,
+          };
+        }
+
+        // stalemate direct check
+        const stalemateFlag = _safeCall(
+          chess,
+          "in_stalemate",
+          "inStalemate",
+          "isStalemate"
+        );
+        if (stalemateFlag) {
+          return {
+            reason: "stalemate",
+            result: "draw",
+            message: "Draw by stalemate",
+            finishedAt: now,
+          };
+        }
+
+        // threefold repetition
+        const threefold = _safeCall(
+          chess,
+          "in_threefold_repetition",
+          "inThreefoldRepetition",
+          "isThreefold"
+        );
+        if (threefold) {
+          return {
+            reason: "threefold-repetition",
+            result: "draw",
+            message: "Draw by threefold repetition",
+            finishedAt: now,
+          };
+        }
+
+        // insufficient material
+        const insufficient = _safeCall(
+          chess,
+          "insufficient_material",
+          "insufficientMaterial",
+          "isInsufficientMaterial"
+        );
+        if (insufficient) {
+          return {
+            reason: "insufficient-material",
+            result: "draw",
+            message: "Draw by insufficient material",
+            finishedAt: now,
+          };
+        }
+
+        // general in_draw
+        const inDraw = _safeCall(chess, "in_draw", "inDraw", "isDraw");
+        if (inDraw) {
+          return {
+            reason: "draw",
+            result: "draw",
+            message: "Draw",
+            finishedAt: now,
+          };
+        }
+
+        // fallback canonical rule:
+        // if there are no legal moves -> if side-to-move is in check -> checkmate else stalemate
+        let moves = [];
+        try {
+          // prefer verbose so we can inspect promotions etc.
+          moves =
+            typeof chess.moves === "function"
+              ? chess.moves({ verbose: true })
+              : [];
+        } catch (e) {
+          try {
+            moves = chess.moves ? chess.moves() : [];
+          } catch {
+            moves = [];
+          }
+        }
+
+        if (!Array.isArray(moves) || moves.length === 0) {
+          const inCheck = _safeCall(chess, "in_check", "inCheck") || false;
+          if (inCheck) {
+            const moverColor = lastMoveResult?.color || null;
+            const winner =
+              moverColor ||
+              (typeof chess.turn === "function"
+                ? chess.turn() === "w"
+                  ? "b"
+                  : "w"
+                : "w");
+            const loser = winner === "w" ? "b" : "w";
+            return {
+              reason: "checkmate",
+              winner,
+              loser,
+              message: `${winner.toUpperCase()} wins by checkmate`,
+              finishedAt: now,
+            };
+          } else {
+            return {
+              reason: "stalemate",
+              result: "draw",
+              message: "Draw by stalemate",
+              finishedAt: now,
+            };
+          }
+        }
+
+        return null;
+      } catch (e) {
+        console.error("detectGameFinished error:", e);
+        return null;
+      }
     }
 
     // Helper: clear any bot timer on room
@@ -90,7 +247,7 @@ module.exports = {
       } catch (e) {}
     }
 
-    // Apply a bot move server-side
+    // Apply a bot move server-side (gameHandler's bot flow)
     async function applyBotMove(roomId) {
       try {
         const room = rooms[roomId];
@@ -166,7 +323,9 @@ module.exports = {
 
         // normalize promotion
         if (aiMove.promotion) {
-          const p = normalizePromotionChar(aiMove.promotion);
+          const p = normalizePromotionChar
+            ? normalizePromotionChar(aiMove.promotion)
+            : aiMove.promotion;
           if (p) aiMove.promotion = p;
           else delete aiMove.promotion;
         }
@@ -209,83 +368,8 @@ module.exports = {
           clearFirstMoveTimer && clearFirstMoveTimer(room);
         } catch (e) {}
 
-        // detect finished states
-        let finishedObj = null;
-
-        let isCheckmate = false;
-        let isStalemate = false;
-        let isThreefold = false;
-        let isInsufficient = false;
-        let isDraw = false;
-        try {
-          if (typeof chess.in_checkmate === "function")
-            isCheckmate = chess.in_checkmate();
-          if (typeof chess.in_stalemate === "function")
-            isStalemate = chess.in_stalemate();
-          if (typeof chess.in_threefold_repetition === "function")
-            isThreefold = chess.in_threefold_repetition();
-          if (typeof chess.insufficient_material === "function")
-            isInsufficient = chess.insufficient_material();
-          if (typeof chess.in_draw === "function") isDraw = chess.in_draw();
-        } catch (e) {}
-
-        // fallback: if moves() returns 0, check in_check to decide mate vs stalemate
-        try {
-          const movesList =
-            chess.moves && Array.isArray(chess.moves({ verbose: true }))
-              ? chess.moves({ verbose: true })
-              : [];
-          if (
-            (!movesList || movesList.length === 0) &&
-            !(isCheckmate || isStalemate)
-          ) {
-            const inCheckNow =
-              (typeof chess.in_check === "function" && chess.in_check()) ||
-              false;
-            if (inCheckNow) isCheckmate = true;
-            else isStalemate = true;
-          }
-        } catch (e) {}
-
-        if (isCheckmate) {
-          const winner = result.color;
-          const loser = winner === "w" ? "b" : "w";
-          finishedObj = {
-            reason: "checkmate",
-            winner,
-            loser,
-            message: `${winner.toUpperCase()} wins by checkmate`,
-            finishedAt: Date.now(),
-          };
-        } else if (isStalemate) {
-          finishedObj = {
-            reason: "stalemate",
-            result: "draw",
-            message: "Draw by stalemate",
-            finishedAt: Date.now(),
-          };
-        } else if (isThreefold) {
-          finishedObj = {
-            reason: "threefold-repetition",
-            result: "draw",
-            message: "Draw by threefold repetition",
-            finishedAt: Date.now(),
-          };
-        } else if (isInsufficient) {
-          finishedObj = {
-            reason: "insufficient-material",
-            result: "draw",
-            message: "Draw by insufficient material",
-            finishedAt: Date.now(),
-          };
-        } else if (isDraw) {
-          finishedObj = {
-            reason: "draw",
-            result: "draw",
-            message: "Draw",
-            finishedAt: Date.now(),
-          };
-        }
+        // detect finished states using unified helper
+        const finishedObj = detectGameFinished(chess, result);
 
         // clear pending draw offers from bot if needed
         if (room.pendingDrawOffer) {
@@ -347,8 +431,6 @@ module.exports = {
             if (!containsBot) {
               if (typeof applyCupsForFinishedRoom === "function")
                 await applyCupsForFinishedRoom(roomId);
-            } else {
-              // if your applyCupsForFinishedRoom internally skips bots, the above check is redundant -- safe guard
             }
           } catch (e) {
             console.error("applyCupsForFinishedRoom error (applyBotMove):", e);
@@ -1035,82 +1117,8 @@ module.exports = {
 
         clearFirstMoveTimer && clearFirstMoveTimer(room);
 
-        // detect finished
-        let finishedObj = null;
-        let isCheckmate = false;
-        let isStalemate = false;
-        let isThreefold = false;
-        let isInsufficient = false;
-        let isDraw = false;
-        try {
-          if (typeof chess.in_checkmate === "function")
-            isCheckmate = chess.in_checkmate();
-          if (typeof chess.in_stalemate === "function")
-            isStalemate = chess.in_stalemate();
-          if (typeof chess.in_threefold_repetition === "function")
-            isThreefold = chess.in_threefold_repetition();
-          if (typeof chess.insufficient_material === "function")
-            isInsufficient = chess.insufficient_material();
-          if (typeof chess.in_draw === "function") isDraw = chess.in_draw();
-        } catch (e) {}
-
-        // fallback moves() length check
-        try {
-          const movesList =
-            chess.moves && Array.isArray(chess.moves({ verbose: true }))
-              ? chess.moves({ verbose: true })
-              : [];
-          if (
-            (!movesList || movesList.length === 0) &&
-            !(isCheckmate || isStalemate)
-          ) {
-            const inCheckNow =
-              (typeof chess.in_check === "function" && chess.in_check()) ||
-              false;
-            if (inCheckNow) isCheckmate = true;
-            else isStalemate = true;
-          }
-        } catch (e) {}
-
-        if (isCheckmate) {
-          const winner = result.color;
-          const loser = winner === "w" ? "b" : "w";
-          finishedObj = {
-            reason: "checkmate",
-            winner,
-            loser,
-            message: `${winner.toUpperCase()} wins by checkmate`,
-            finishedAt: Date.now(),
-          };
-        } else if (isStalemate) {
-          finishedObj = {
-            reason: "stalemate",
-            result: "draw",
-            message: "Draw by stalemate",
-            finishedAt: Date.now(),
-          };
-        } else if (isThreefold) {
-          finishedObj = {
-            reason: "threefold-repetition",
-            result: "draw",
-            message: "Draw by threefold repetition",
-            finishedAt: Date.now(),
-          };
-        } else if (isInsufficient) {
-          finishedObj = {
-            reason: "insufficient-material",
-            result: "draw",
-            message: "Draw by insufficient material",
-            finishedAt: Date.now(),
-          };
-        } else if (isDraw) {
-          finishedObj = {
-            reason: "draw",
-            result: "draw",
-            message: "Draw",
-            finishedAt: Date.now(),
-          };
-        }
+        // detect finished using unified helper
+        const finishedObj = detectGameFinished(chess, result);
 
         if (!room.clocks) {
           if (!finishedObj) {
@@ -1538,6 +1546,8 @@ module.exports = {
       }
     });
 
+    // ---------------- Rematch handlers (robust acceptance matching) ----------------
+
     socket.on("play-again", ({ roomId }) => {
       try {
         if (!roomId) return;
@@ -1554,6 +1564,11 @@ module.exports = {
         if (!room.rematch.initiatorUserId)
           room.rematch.initiatorUserId = socket.user?.id || null;
         room.rematch.acceptedBy = room.rematch.acceptedBy || {};
+        // set acceptance for initiator (so initiating player is immediately counted)
+        if (socket.user && socket.user.id)
+          room.rematch.acceptedBy[String(socket.user.id)] = true;
+        room.rematch.acceptedBy[socket.id] = true;
+
         // if there are two colored players, notify the opponent
         const opponent = room.players.find(
           (p) => (p.color === "w" || p.color === "b") && p.id !== socket.id
@@ -1574,6 +1589,34 @@ module.exports = {
       }
     });
 
+    // Helper to check whether a player has accepted rematch using multiple possible keys
+    function hasPlayerAcceptedRematch(room, player) {
+      try {
+        if (!room || !room.rematch || !room.rematch.acceptedBy) return false;
+        const keys = room.rematch.acceptedBy;
+        // check by player.id (often socket id), and by user.id (persistent user id)
+        if (player.id && keys[String(player.id)]) return true;
+        if (
+          player.user &&
+          (player.user.id || player.user._id) &&
+          keys[String(player.user.id || player.user._id)]
+        )
+          return true;
+        // also check by username fallback
+        if (
+          player.user &&
+          player.user.username &&
+          keys[`username:${player.user.username}`]
+        )
+          return true;
+        return false;
+      } catch (e) {
+        return false;
+      }
+    }
+
+    // PLAY AGAIN PLACE
+
     socket.on("accept-play-again", async ({ roomId }) => {
       try {
         if (!roomId) return;
@@ -1581,17 +1624,21 @@ module.exports = {
         if (!room || !room.rematch) return;
         // mark accepted and when both accepted start new game
         room.rematch.acceptedBy = room.rematch.acceptedBy || {};
+        // mark acceptance by socket id and by authenticated user id (if present)
         room.rematch.acceptedBy[socket.id] = true;
+        if (socket.user && socket.user.id)
+          room.rematch.acceptedBy[String(socket.user.id)] = true;
+
         const coloredPlayers = (room.players || []).filter(
           (p) => p.color === "w" || p.color === "b"
         );
-        const allAccepted = coloredPlayers.every(
-          (p) => room.rematch.acceptedBy[p.id]
-        );
+        const allAccepted =
+          coloredPlayers.length > 0 &&
+          coloredPlayers.every((p) => hasPlayerAcceptedRematch(room, p));
+
         if (allAccepted) {
-          // start rematch: create new room state or reuse room by resetting fen and moves
+          // start rematch: reset board in-place
           try {
-            // simple rematch: reset chess, moves, clocks, finished, pendingDrawOffer, rematch structure
             room.chess = new Chess();
             room.fen = room.chess.fen();
             room.moves = [];
@@ -1599,7 +1646,6 @@ module.exports = {
             room.finished = null;
             room.pendingDrawOffer = null;
             room.paused = false;
-            room.rematch = null;
             // reset clocks to settings
             room.clocks = {
               w: room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
@@ -1607,6 +1653,9 @@ module.exports = {
               running: room.chess.turn(),
               lastTick: Date.now(),
             };
+            // clear rematch structure
+            room.rematch = null;
+
             // broadcast and notify clients
             io.to(roomId).emit("play-again", { started: true, roomId });
             broadcastRoomState && broadcastRoomState(roomId);
@@ -1717,6 +1766,7 @@ module.exports = {
       }
     });
 
+    // ENQUEUE-MATCH I HAVE IT
     // replace existing "enqueue-match" handler with this (robust multi-fallback enqueue)
     socket.on("enqueue-match", ({ cups, minutes } = {}) => {
       try {
