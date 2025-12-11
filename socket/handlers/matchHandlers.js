@@ -1,3 +1,4 @@
+// backend/socket/handlers/matchHandlers.js
 module.exports = {
   registerAll(socket, context) {
     const {
@@ -115,15 +116,7 @@ module.exports = {
       }
     });
 
-    /**
-     * NEW: create-room handler (supports bot opponent)
-     *
-     * Client may call:
-     *  socket.emit("create-room", { minutes, colorPreference, userB: { id:'bot:2-<ts>', username:'Bot' }, botLevel: 2 })
-     *
-     * If payload.userB.id starts with "bot:" or payload.botLevel present, this will create a server-side
-     * bot player entry (no socket). The room is broadcasted and roomManager logic can pick it up and move the bot.
-     */
+    // NEW: create-room handler (supports bot opponent)
     socket.on("create-room", async (payload = {}) => {
       try {
         const minutes = Math.max(1, Math.floor(Number(payload.minutes || 5)));
@@ -169,14 +162,14 @@ module.exports = {
           }
         }
 
-        // build room skeleton
+        // build room skeleton — DO NOT initialize clocks yet
         const room = {
           players: [],
           moves: [],
           chess: new Chess(),
           fen: null,
           lastIndex: -1,
-          clocks: null,
+          clocks: null, // defer initializing clocks until two colored players are present AND online
           paused: false,
           disconnectTimers: {},
           firstMoveTimer: null,
@@ -273,15 +266,7 @@ module.exports = {
         room.players.push(creatorPlayer);
         if (botPlayer) room.players.push(botPlayer);
 
-        // clocks
-        room.clocks = {
-          w: minutesMs,
-          b: minutesMs,
-          running: room.chess.turn(),
-          lastTick: Date.now(),
-        };
-
-        // bot meta in room.settings so roomManager/scheduler can use it
+        // Bot meta in room.settings so roomManager/scheduler can use it
         if (botPlayer) {
           room.settings.bot = {
             enabled: true,
@@ -290,7 +275,7 @@ module.exports = {
           };
         }
 
-        // persist in-memory and join socket to room
+        // Persist in-memory and join socket to room
         rooms[roomId] = room;
 
         try {
@@ -301,9 +286,37 @@ module.exports = {
         // broadcast initial state (this will also persist snapshot and trigger bot scheduler in roomManager)
         broadcastRoomState(roomId);
 
-        // schedule first-move and expiration (if your room manager expects these functions elsewhere)
+        // AFTER broadcasting initial state, initialize clocks only when two colored players are present AND both online and not a bot-only room
         try {
-          scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
+          const coloredPlayers = (room.players || []).filter(
+            (p) => p.color === "w" || p.color === "b"
+          );
+          const activeCount = coloredPlayers.filter((p) => !!p.online).length;
+          const containsBot = (room.players || []).some((p) =>
+            String(p.id || "")
+              .toLowerCase()
+              .startsWith("bot:")
+          );
+
+          if (
+            !containsBot &&
+            coloredPlayers.length === 2 &&
+            activeCount === 2 &&
+            !room.finished
+          ) {
+            room.clocks = {
+              w: minutesMs,
+              b: minutesMs,
+              running: room.chess.turn(),
+              lastTick: Date.now(),
+            };
+            try {
+              scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
+            } catch (e) {}
+          } else {
+            // keep clocks null until second player fully connects (or if bot handling decides otherwise)
+            room.clocks = room.clocks || null;
+          }
         } catch (e) {}
 
         // Notify creator
@@ -494,7 +507,7 @@ module.exports = {
             chess: new Chess(),
             fen: null,
             lastIndex: -1,
-            clocks: null,
+            clocks: null, // defer clock init until both players online
             paused: false,
             disconnectTimers: {},
             firstMoveTimer: null,
@@ -569,12 +582,36 @@ module.exports = {
           room.players.push(initiatorPlayer);
           room.players.push(acceptorPlayer);
 
-          room.clocks = {
-            w: room.settings.minutesMs,
-            b: room.settings.minutesMs,
-            running: room.chess.turn(),
-            lastTick: Date.now(),
-          };
+          // initialize clocks only when both colored players are present and online
+          try {
+            const colored = (room.players || []).filter(
+              (p) => p.color === "w" || p.color === "b"
+            );
+            const activeCount = colored.filter((p) => !!p.online).length;
+            const containsBot = (room.players || []).some((p) =>
+              String(p.id || "")
+                .toLowerCase()
+                .startsWith("bot:")
+            );
+            if (
+              !containsBot &&
+              colored.length === 2 &&
+              activeCount === 2 &&
+              !room.finished
+            ) {
+              room.clocks = {
+                w: room.settings.minutesMs,
+                b: room.settings.minutesMs,
+                running: room.chess.turn(),
+                lastTick: Date.now(),
+              };
+              try {
+                scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
+              } catch (e) {}
+            } else {
+              room.clocks = room.clocks || null;
+            }
+          } catch (e) {}
 
           rooms[roomId] = room;
 

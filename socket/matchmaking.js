@@ -345,16 +345,39 @@ async function attemptMatchmaking(context) {
           room.players.push(pA);
           room.players.push(pB);
 
-          room.clocks = {
-            w: room.settings.minutesMs,
-            b: room.settings.minutesMs,
-            running: room.chess.turn(),
-            lastTick: Date.now(),
-          };
+          // initialize clocks only when two colored players are present and both online AND not a bot room
+          try {
+            const colored = room.players.filter(
+              (p) => p.color === "w" || p.color === "b"
+            );
+            const activeCount = colored.filter((p) => !!p.online).length;
+            // detect bot presence either through settings.bot or player id pattern
+            const isBot =
+              (room.settings && room.settings.bot) ||
+              (room.players || []).some((p) =>
+                String(p.id || "")
+                  .toLowerCase()
+                  .startsWith("bot:")
+              );
+            if (!isBot && colored.length === 2 && activeCount === 2) {
+              room.clocks = {
+                w: room.settings.minutesMs,
+                b: room.settings.minutesMs,
+                running: room.chess.turn(),
+                lastTick: Date.now(),
+              };
+              try {
+                context.scheduleFirstMoveTimer &&
+                  context.scheduleFirstMoveTimer(fallbackRoomId);
+              } catch (e) {}
+            } else {
+              room.clocks = room.clocks || null;
+            }
+          } catch (e) {}
 
           context.rooms[fallbackRoomId] = room;
           context.broadcastRoomState(fallbackRoomId);
-          context.scheduleFirstMoveTimer(fallbackRoomId);
+          // scheduleFirstMoveTimer was attempted above only if clocks were created
           createdRoomId = fallbackRoomId;
         } catch (err) {
           console.error("play-online: fallback room creation failed", err);
