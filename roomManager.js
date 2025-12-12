@@ -518,79 +518,121 @@ async function saveFinishedGame(roomId) {
       });
     }
 
-    // Attempt to call existing applyCups module first (many projects expose this)
+    // ----------------- IMPORTANT: Only apply cups for clear wins -----------------
+    // If the finish is a draw or a reason that implies a draw/ambiguous, DO NOT apply cups.
+    const drawReasons = new Set([
+      "draw",
+      "stalemate",
+      "threefold-repetition",
+      "insufficient-material",
+      "draw-agreed",
+      "abandoned",
+    ]);
+    const finishedReason = (finishedToSave && finishedToSave.reason) || null;
+    const finishedResult = (finishedToSave && finishedToSave.result) || null;
+    const isDraw =
+      String(finishedResult).toLowerCase() === "draw" ||
+      (finishedReason && drawReasons.has(String(finishedReason)));
+
+    if (isDraw) {
+      console.log(
+        "[saveFinishedGame] detected draw/ambiguous finish — skipping applyCups/fallback.",
+        finishedToSave
+      );
+      return;
+    }
+
+    // Now we only attempt applyCups/fallback when we have a non-draw finish.
     try {
-      // try a few common paths
-      const tryPaths = [
-        path.join(__dirname, "socket", "applyCups"),
-        path.join(__dirname, "applyCups"),
-        path.join(__dirname, "..", "socket", "applyCups"),
-        path.join(__dirname, "..", "src", "socket", "applyCups"),
-        path.join(process.cwd(), "backend", "socket", "applyCups"),
-        path.join(process.cwd(), "socket", "applyCups"),
-        "./socket/applyCups",
-        "./applyCups",
-      ];
-      let applyCupsModule = null;
-      for (const p of tryPaths) {
-        try {
-          applyCupsModule = require(p);
-          if (applyCupsModule) break;
-        } catch (e) {
-          // ignore
-        }
-      }
+      // Ensure 'path' is defined (fix ReferenceError when requiring by path)
+      const path = require("path");
 
-      if (applyCupsModule) {
-        // find a callable function
-        let applyCupsFunc = null;
-        if (typeof applyCupsModule === "function")
-          applyCupsFunc = applyCupsModule;
-        else if (typeof applyCupsModule.applyCupsForFinishedRoom === "function")
-          applyCupsFunc = applyCupsModule.applyCupsForFinishedRoom;
-        else if (typeof applyCupsModule.default === "function")
-          applyCupsFunc = applyCupsModule.default;
-
-        if (!applyCupsFunc) {
-          console.warn(
-            "[saveFinishedGame] applyCups module found but no callable exported function"
-          );
-        } else {
-          // try calling it with common signatures: (ctx, gameId) or (gameId)
-          let calledRes = null;
+      // Only attempt to call a project's applyCups if winnerId & loserId have been resolved.
+      if (!(finishedToSave.winnerId && finishedToSave.loserId)) {
+        console.log(
+          "[saveFinishedGame] cannot apply cups: winner/loser not resolved for non-draw finish. finished:",
+          finishedToSave
+        );
+      } else {
+        // try a few common paths
+        const tryPaths = [
+          path.join(__dirname, "socket", "applyCups"),
+          path.join(__dirname, "applyCups"),
+          path.join(__dirname, "..", "socket", "applyCups"),
+          path.join(__dirname, "..", "src", "socket", "applyCups"),
+          path.join(process.cwd(), "backend", "socket", "applyCups"),
+          path.join(process.cwd(), "socket", "applyCups"),
+          "./socket/applyCups",
+          "./applyCups",
+        ];
+        let applyCupsModule = null;
+        for (const p of tryPaths) {
           try {
-            const ctx = {
-              Game,
-              User,
-              ratingUtils:
-                typeof ratingUtils !== "undefined" ? ratingUtils : null,
-              io,
-              notifyUser:
-                typeof notifyUser === "function" ? notifyUser : () => {},
-            };
-            calledRes = await applyCupsFunc(ctx, doc._id);
+            applyCupsModule = require(p);
+            if (applyCupsModule) break;
           } catch (e) {
-            try {
-              calledRes = await applyCupsFunc(doc._id);
-            } catch (err) {
-              console.error("[saveFinishedGame] applyCups call error:", err);
-              calledRes = null;
-            }
+            // ignore
           }
-          if (calledRes && calledRes.ok) {
-            console.log("[saveFinishedGame] applyCups reported ok:", calledRes);
-          } else if (calledRes) {
+        }
+
+        if (applyCupsModule) {
+          // find a callable function
+          let applyCupsFunc = null;
+          if (typeof applyCupsModule === "function")
+            applyCupsFunc = applyCupsModule;
+          else if (
+            typeof applyCupsModule.applyCupsForFinishedRoom === "function"
+          )
+            applyCupsFunc = applyCupsModule.applyCupsForFinishedRoom;
+          else if (typeof applyCupsModule.default === "function")
+            applyCupsFunc = applyCupsModule.default;
+
+          if (!applyCupsFunc) {
             console.warn(
-              "[saveFinishedGame] applyCups reported non-ok:",
-              calledRes
+              "[saveFinishedGame] applyCups module found but no callable exported function"
             );
           } else {
-            console.warn("[saveFinishedGame] applyCups returned falsy result");
+            // try calling it with common signatures: (ctx, gameId) or (gameId)
+            let calledRes = null;
+            try {
+              const ctx = {
+                Game,
+                User,
+                ratingUtils:
+                  typeof ratingUtils !== "undefined" ? ratingUtils : null,
+                io,
+                notifyUser:
+                  typeof notifyUser === "function" ? notifyUser : () => {},
+              };
+              calledRes = await applyCupsFunc(ctx, doc._id);
+            } catch (e) {
+              try {
+                calledRes = await applyCupsFunc(doc._id);
+              } catch (err) {
+                console.error("[saveFinishedGame] applyCups call error:", err);
+                calledRes = null;
+              }
+            }
+            if (calledRes && calledRes.ok) {
+              console.log(
+                "[saveFinishedGame] applyCups reported ok:",
+                calledRes
+              );
+            } else if (calledRes) {
+              console.warn(
+                "[saveFinishedGame] applyCups reported non-ok:",
+                calledRes
+              );
+            } else {
+              console.warn(
+                "[saveFinishedGame] applyCups returned falsy result"
+              );
+            }
+            // proceed — if applyCups did the work, good; if not, fallback below handles it
           }
-          return;
+        } else {
+          console.warn("[saveFinishedGame] could not locate applyCups module");
         }
-      } else {
-        console.warn("[saveFinishedGame] could not locate applyCups module");
       }
     } catch (e) {
       console.error(
@@ -1145,14 +1187,16 @@ async function performBotMove(roomId, opts = {}) {
     // recompute chess object
     if (!room.chess) room.chess = room.fen ? new Chess(room.fen) : new Chess();
 
-    // find bot player entry in room.players (your code used isBotPlayerEntry earlier)
+    // find bot player entry in room.players
     const botPlayer = (room.players || []).find((p) => {
-      // bot players often have user id starting with 'bot:' or user object missing real id
       const uid = p.user?.id || p.user?._id || p.id || "";
       return (
         String(uid).toLowerCase().startsWith("bot:") ||
         (p.user && p.user.isBot) ||
-        (p.id && String(p.id).startsWith("bot:"))
+        (p.id && String(p.id).startsWith("bot:")) ||
+        (p.user &&
+          typeof p.user.username === "string" &&
+          String(p.user.username).toLowerCase().startsWith("bot"))
       );
     });
     if (!botPlayer) {
@@ -1211,25 +1255,42 @@ async function performBotMove(roomId, opts = {}) {
     // unified finished detection using the robust helper
     const finishedObj = detectGameFinishedForRoom(room.chess, result);
 
-    // update clocks
-    if (!room.clocks) {
-      const minutes = room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
-      const ms = room.settings?.minutesMs || minutes * 60 * 1000;
-      room.clocks = {
-        w: ms,
-        b: ms,
-        running: room.chess.turn(),
-        lastTick: Date.now(),
-      };
-    } else {
-      if (finishedObj) {
-        room.paused = true;
-        room.clocks.running = null;
-        room.clocks.lastTick = null;
+    // ----------------------------
+    // IMPORTANT: Do NOT create or update clocks for bot rooms.
+    // ----------------------------
+    try {
+      const botPresent = isBotRoom(room);
+      if (botPresent) {
+        // ensure no clocks exist for bot rooms
+        room.clocks = null;
       } else {
-        room.clocks.running = room.chess.turn();
-        room.clocks.lastTick = Date.now();
+        // existing behavior for non-bot rooms
+        if (!room.clocks) {
+          const minutes =
+            (room.settings && room.settings.minutes) ||
+            Math.floor(DEFAULT_MS / 60000);
+          const ms =
+            (room.settings && room.settings.minutesMs) || minutes * 60 * 1000;
+          room.clocks = {
+            w: ms,
+            b: ms,
+            running: room.chess.turn(),
+            lastTick: Date.now(),
+          };
+        } else {
+          if (finishedObj) {
+            room.paused = true;
+            room.clocks.running = null;
+            room.clocks.lastTick = null;
+          } else {
+            room.clocks.running = room.chess.turn();
+            room.clocks.lastTick = Date.now();
+          }
+        }
       }
+    } catch (e) {
+      // never let clock handling break the bot move
+      console.error("performBotMove: clock update error (ignored)", e);
     }
 
     // clear draw offer if originating from bot
@@ -1245,7 +1306,6 @@ async function performBotMove(roomId, opts = {}) {
 
     // notify opponent via socket emit (match existing behavior)
     try {
-      // roomId is string key
       io.to(roomId).emit("opponent-move", {
         ...record,
         fen: room.fen,
@@ -1280,7 +1340,21 @@ async function performBotMove(roomId, opts = {}) {
         console.error("performBotMove: saveFinishedGame failed", e);
       }
       try {
-        await applyCupsForFinishedRoom(roomId);
+        // call applyCupsForFinishedRoom only if present and only when finish is decisive
+        const shouldApply =
+          room.finished &&
+          room.finished.result !== "draw" &&
+          (room.finished.winnerId ||
+            room.finished.winner ||
+            room.finished.reason);
+        if (shouldApply && typeof applyCupsForFinishedRoom === "function") {
+          await applyCupsForFinishedRoom(roomId);
+        } else {
+          console.log(
+            "[performBotMove] skipping applyCupsForFinishedRoom because finish is draw/ambiguous or function not defined",
+            { finished: room.finished }
+          );
+        }
       } catch (e) {
         console.error("performBotMove: applyCupsForFinishedRoom failed", e);
       }
@@ -1294,6 +1368,7 @@ async function performBotMove(roomId, opts = {}) {
     return false;
   }
 }
+
 // ---------- end paste ----------
 
 function scheduleBotIfNeeded(roomId) {

@@ -50,6 +50,52 @@ module.exports = {
       jsChessEngineAdapter = null;
     }
 
+    // --- Add these helpers near the top of registerAll or module scope ---
+
+    function containsBotPlayer(room) {
+      if (!room || !Array.isArray(room.players)) return false;
+      return room.players.some((p) => {
+        if (!p) return false;
+        const id = String(p.id || "").toLowerCase();
+        if (id.startsWith("bot:")) return true;
+        if (p.user && typeof p.user.username === "string") {
+          const u = String(p.user.username).toLowerCase();
+          if (u === "bot" || u.startsWith("bot:")) return true;
+        }
+        if (p.isBot) return true;
+        return false;
+      });
+    }
+
+    /**
+     * finishLooksDecisive(room)
+     * Return true when the finished object represents a decisive finish that should affect cups.
+     * Returns false on draws (draw-agreed, stalemate, threefold, insufficient material, etc).
+     */
+    function finishLooksDecisive(room) {
+      try {
+        if (!room || !room.finished) return false;
+        const f = room.finished;
+        // If explicit winner/loser ids/fields exist -> decisive
+        if (f.winnerId || f.loserId) return true;
+        if (f.winner || f.loser) return true;
+        // If result explicitly set to draw -> do NOT apply cups
+        if (String(f.result || "").toLowerCase() === "draw") return false;
+        // Known decisive reasons
+        const decisiveReasons = new Set([
+          "checkmate",
+          "resign",
+          "timeout",
+          "opponent-disconnected",
+        ]);
+        if (f.reason && decisiveReasons.has(String(f.reason))) return true;
+        // Conservative default: not decisive
+        return false;
+      } catch (e) {
+        return false;
+      }
+    }
+
     // Helper: convert a provided level (rating number or 0-4) to engine level 0..4
     function mapRequestedBotLevelToEngine(level) {
       const n = Number(level);
@@ -346,20 +392,30 @@ module.exports = {
         room.fen = chess.fen();
 
         // clocks: update similar to human move handling
+        // Do NOT create/update clocks for bot rooms — bot games are unlimited time.
         try {
-          if (!room.clocks) {
-            const minutes =
-              room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
-            const ms = room.settings?.minutesMs || minutes * 60 * 1000;
-            room.clocks = {
-              w: ms,
-              b: ms,
-              running: chess.turn(),
-              lastTick: Date.now(),
-            };
+          const containsBot = (room.players || []).some((p) =>
+            String(p.id || "")
+              .toLowerCase()
+              .startsWith("bot:")
+          );
+          if (containsBot) {
+            room.clocks = null;
           } else {
-            room.clocks.running = chess.turn();
-            room.clocks.lastTick = Date.now();
+            if (!room.clocks) {
+              const minutes =
+                room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
+              const ms = room.settings?.minutesMs || minutes * 60 * 1000;
+              room.clocks = {
+                w: ms,
+                b: ms,
+                running: chess.turn(),
+                lastTick: Date.now(),
+              };
+            } else {
+              room.clocks.running = chess.turn();
+              room.clocks.lastTick = Date.now();
+            }
           }
         } catch (e) {}
 
@@ -672,8 +728,14 @@ module.exports = {
               const coloredNow = room.players.filter(
                 (p) => p.color === "w" || p.color === "b"
               );
-              if (coloredNow.length === 2) {
-                // init clocks
+              const containsBot = (room.players || []).some((p) =>
+                String(p.id || "")
+                  .toLowerCase()
+                  .startsWith("bot:")
+              );
+
+              // For bot games: do NOT initialize clocks (we want unlimited time).
+              if (!containsBot && coloredNow.length === 2) {
                 room.clocks = {
                   w: room.settings.minutesMs || minutesMs,
                   b: room.settings.minutesMs || minutesMs,
@@ -682,6 +744,10 @@ module.exports = {
                 };
                 scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
               } else {
+                // keep clocks null for bot rooms (ultimate time)
+                if (containsBot) room.clocks = null;
+
+                // if human was spectator, assign them the other color (unchanged)
                 // if human was spectator, assign them the other color
                 const humanEntry = room.players.find((p) => p.id === socket.id);
                 if (
@@ -715,7 +781,18 @@ module.exports = {
             const colored = room.players.filter(
               (p) => p.color === "w" || p.color === "b"
             );
-            if (colored.length === 2 && !room.clocks && !room.finished) {
+            const containsBot = (room.players || []).some((p) =>
+              String(p.id || "")
+                .toLowerCase()
+                .startsWith("bot:")
+            );
+
+            if (
+              !containsBot &&
+              colored.length === 2 &&
+              !room.clocks &&
+              !room.finished
+            ) {
               room.clocks = {
                 w: room.settings.minutesMs || minutesMs,
                 b: room.settings.minutesMs || minutesMs,
@@ -723,6 +800,9 @@ module.exports = {
                 lastTick: Date.now(),
               };
               scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
+            } else if (containsBot) {
+              // ensure clocks remain null for bot games
+              room.clocks = null;
             }
           } catch (e) {}
 
@@ -958,23 +1038,34 @@ module.exports = {
         const coloredPlayers = room.players.filter(
           (p) => p.color === "w" || p.color === "b"
         );
-        if (!room.clocks && coloredPlayers.length === 2 && !room.finished) {
-          room.clocks = {
-            w: room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
-            b: room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
-            running: room.chess.turn(),
-            lastTick: Date.now(),
-          };
-          scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
-        } else if (
-          coloredPlayers.length === 2 &&
-          !room.clocks?.running &&
-          !room.finished
-        ) {
-          room.clocks.running = room.chess.turn();
-          room.clocks.lastTick = Date.now();
-          room.paused = false;
-          scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
+        const containsBot = (room.players || []).some((p) =>
+          String(p.id || "")
+            .toLowerCase()
+            .startsWith("bot:")
+        );
+
+        if (!containsBot) {
+          if (!room.clocks && coloredPlayers.length === 2 && !room.finished) {
+            room.clocks = {
+              w: room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
+              b: room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
+              running: room.chess.turn(),
+              lastTick: Date.now(),
+            };
+            scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
+          } else if (
+            coloredPlayers.length === 2 &&
+            !room.clocks?.running &&
+            !room.finished
+          ) {
+            room.clocks.running = room.chess.turn();
+            room.clocks.lastTick = Date.now();
+            room.paused = false;
+            scheduleFirstMoveTimer && scheduleFirstMoveTimer(roomId);
+          }
+        } else {
+          // ensure bot rooms never get clocks
+          room.clocks = null;
         }
 
         broadcastRoomState && broadcastRoomState(roomId);
@@ -1120,33 +1211,44 @@ module.exports = {
         // detect finished using unified helper
         const finishedObj = detectGameFinished(chess, result);
 
-        if (!room.clocks) {
-          if (!finishedObj) {
-            const minutes =
-              room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
-            const ms = room.settings?.minutesMs || minutes * 60 * 1000;
-            room.clocks = {
-              w: ms,
-              b: ms,
-              running: chess.turn(),
-              lastTick: Date.now(),
-            };
-          } else {
-            room.clocks = {
-              w: room.clocks?.w ?? DEFAULT_MS,
-              b: room.clocks?.b ?? DEFAULT_MS,
-              running: null,
-              lastTick: null,
-            };
-          }
+        const containsBot = (room.players || []).some((p) =>
+          String(p.id || "")
+            .toLowerCase()
+            .startsWith("bot:")
+        );
+
+        if (containsBot) {
+          // Bot games have unlimited time: never create or update clocks
+          room.clocks = null;
         } else {
-          if (finishedObj) {
-            room.paused = true;
-            room.clocks.running = null;
-            room.clocks.lastTick = null;
+          if (!room.clocks) {
+            if (!finishedObj) {
+              const minutes =
+                room.settings?.minutes || Math.floor(DEFAULT_MS / 60000);
+              const ms = room.settings?.minutesMs || minutes * 60 * 1000;
+              room.clocks = {
+                w: ms,
+                b: ms,
+                running: chess.turn(),
+                lastTick: Date.now(),
+              };
+            } else {
+              room.clocks = {
+                w: room.clocks?.w ?? DEFAULT_MS,
+                b: room.clocks?.b ?? DEFAULT_MS,
+                running: null,
+                lastTick: null,
+              };
+            }
           } else {
-            room.clocks.running = chess.turn();
-            room.clocks.lastTick = Date.now();
+            if (finishedObj) {
+              room.paused = true;
+              room.clocks.running = null;
+              room.clocks.lastTick = null;
+            } else {
+              room.clocks.running = chess.turn();
+              room.clocks.lastTick = Date.now();
+            }
           }
         }
 
@@ -1191,21 +1293,22 @@ module.exports = {
           broadcastRoomState && broadcastRoomState(roomId);
 
           // persist and apply cups - skip for bot games
+          // new
           try {
-            if (typeof saveFinishedGame === "function")
+            if (typeof saveFinishedGame === "function") {
               await saveFinishedGame(roomId);
+            }
           } catch (e) {
             console.error("saveFinishedGame error (make-move):", e);
           }
+
           try {
-            const containsBot = (room.players || []).some((p) =>
-              String(p.id || "")
-                .toLowerCase()
-                .startsWith("bot:")
-            );
-            if (!containsBot) {
-              if (typeof applyCupsForFinishedRoom === "function")
+            // apply cups ONLY when not a bot game AND the finished state is decisive.
+            const hasBot = containsBotPlayer(room);
+            if (!hasBot && finishLooksDecisive(room)) {
+              if (typeof applyCupsForFinishedRoom === "function") {
                 await applyCupsForFinishedRoom(roomId);
+              }
             }
           } catch (e) {
             console.error("applyCupsForFinishedRoom error (make-move):", e);
@@ -1310,26 +1413,17 @@ module.exports = {
         clearBotTimeout(room);
         broadcastRoomState && broadcastRoomState(roomId);
         io.to(roomId).emit("game-over", { ...room.finished });
+        // new
         (async () => {
           try {
-            if (typeof saveFinishedGame === "function")
+            if (typeof saveFinishedGame === "function") {
               await saveFinishedGame(roomId);
+            }
           } catch (e) {
             console.error("saveFinishedGame error (accept-draw)", e);
           }
-          try {
-            const containsBot = (room.players || []).some((p) =>
-              String(p.id || "")
-                .toLowerCase()
-                .startsWith("bot:")
-            );
-            if (!containsBot) {
-              if (typeof applyCupsForFinishedRoom === "function")
-                await applyCupsForFinishedRoom(roomId);
-            }
-          } catch (e) {
-            console.error("applyCupsForFinishedRoom error (accept-draw)", e);
-          }
+          // IMPORTANT: do NOT call applyCupsForFinishedRoom for draws (draw-agreed).
+          // Cups should not change on draws by agreement.
         })();
       } catch (e) {
         console.error("accept-draw error:", e);
@@ -1379,21 +1473,21 @@ module.exports = {
           });
           clearBotTimeout(room);
           broadcastRoomState && broadcastRoomState(roomId);
+          // new
           try {
-            if (typeof saveFinishedGame === "function")
+            if (typeof saveFinishedGame === "function") {
               await saveFinishedGame(roomId);
+            }
           } catch (e) {
             console.error("saveFinishedGame error (resign)", e);
           }
+
           try {
-            const containsBot = (room.players || []).some((p) =>
-              String(p.id || "")
-                .toLowerCase()
-                .startsWith("bot:")
-            );
-            if (!containsBot) {
-              if (typeof applyCupsForFinishedRoom === "function")
+            const hasBot = containsBotPlayer(room);
+            if (!hasBot && finishLooksDecisive(room)) {
+              if (typeof applyCupsForFinishedRoom === "function") {
                 await applyCupsForFinishedRoom(roomId);
+              }
             }
           } catch (e) {
             console.error("applyCupsForFinishedRoom error (resign)", e);
@@ -1502,22 +1596,27 @@ module.exports = {
               clearFirstMoveTimer && clearFirstMoveTimer(room);
               clearBotTimeout(room);
               broadcastRoomState && broadcastRoomState(roomId);
+              // new
               (async () => {
                 try {
                   if (typeof saveFinishedGame === "function")
                     await saveFinishedGame(roomId);
-                } catch (e) {}
+                } catch (e) {
+                  console.error("saveFinishedGame error (leave-room)", e);
+                }
                 try {
-                  const containsBot = (room.players || []).some((p) =>
-                    String(p.id || "")
-                      .toLowerCase()
-                      .startsWith("bot:")
-                  );
-                  if (!containsBot) {
-                    if (typeof applyCupsForFinishedRoom === "function")
+                  const hasBot = containsBotPlayer(room);
+                  if (!hasBot && finishLooksDecisive(room)) {
+                    if (typeof applyCupsForFinishedRoom === "function") {
                       await applyCupsForFinishedRoom(roomId);
+                    }
                   }
-                } catch (e) {}
+                } catch (e) {
+                  console.error(
+                    "applyCupsForFinishedRoom error (leave-room)",
+                    e
+                  );
+                }
               })();
             }
           }
@@ -1646,13 +1745,26 @@ module.exports = {
             room.finished = null;
             room.pendingDrawOffer = null;
             room.paused = false;
-            // reset clocks to settings
-            room.clocks = {
-              w: room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
-              b: room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
-              running: room.chess.turn(),
-              lastTick: Date.now(),
-            };
+
+            // reset clocks to settings only for non-bot rematch
+            const containsBot = (room.players || []).some((p) =>
+              String(p.id || "")
+                .toLowerCase()
+                .startsWith("bot:")
+            );
+            if (!containsBot) {
+              room.clocks = {
+                w:
+                  room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
+                b:
+                  room.settings?.minutesMs || room.settings.minutes * 60 * 1000,
+                running: room.chess.turn(),
+                lastTick: Date.now(),
+              };
+            } else {
+              room.clocks = null;
+            }
+
             // clear rematch structure
             room.rematch = null;
 
@@ -1741,21 +1853,21 @@ module.exports = {
           });
           clearBotTimeout(room);
           broadcastRoomState && broadcastRoomState(roomId);
+          // new
           try {
-            if (typeof saveFinishedGame === "function")
+            if (typeof saveFinishedGame === "function") {
               await saveFinishedGame(roomId);
+            }
           } catch (e) {
             console.error("saveFinishedGame error (player-timeout)", e);
           }
+
           try {
-            const containsBot = (room.players || []).some((p) =>
-              String(p.id || "")
-                .toLowerCase()
-                .startsWith("bot:")
-            );
-            if (!containsBot) {
-              if (typeof applyCupsForFinishedRoom === "function")
+            const hasBot = containsBotPlayer(room);
+            if (!hasBot && finishLooksDecisive(room)) {
+              if (typeof applyCupsForFinishedRoom === "function") {
                 await applyCupsForFinishedRoom(roomId);
+              }
             }
           } catch (e) {
             console.error("applyCupsForFinishedRoom error (player-timeout)", e);
@@ -2014,6 +2126,7 @@ module.exports = {
                     clearFirstMoveTimer && clearFirstMoveTimer(room);
                     clearBotTimeout(room);
                     broadcastRoomState && broadcastRoomState(rId);
+                    // new
                     try {
                       if (typeof saveFinishedGame === "function")
                         await saveFinishedGame(rId);
@@ -2024,14 +2137,11 @@ module.exports = {
                       );
                     }
                     try {
-                      const containsBot = (room.players || []).some((pp) =>
-                        String(pp.id || "")
-                          .toLowerCase()
-                          .startsWith("bot:")
-                      );
-                      if (!containsBot) {
-                        if (typeof applyCupsForFinishedRoom === "function")
+                      const hasBot = containsBotPlayer(room);
+                      if (!hasBot && finishLooksDecisive(room)) {
+                        if (typeof applyCupsForFinishedRoom === "function") {
                           await applyCupsForFinishedRoom(rId);
+                        }
                       }
                     } catch (e) {
                       console.error(

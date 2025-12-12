@@ -74,6 +74,43 @@ function findSocketsForKeys(keys, context) {
   return out;
 }
 
+/* Helper: robust bot detection for a room object or player entries.
+   Returns boolean.
+*/
+function detectIsBotRoomFromPlayers(players = [], settings = {}) {
+  try {
+    if (settings && settings.bot) return true;
+    if (!Array.isArray(players)) return false;
+    for (const p of players) {
+      if (!p) continue;
+      // check p.user.id, p.user.username, p.id, p.username, or explicit flags
+      const candidateId =
+        (p.user && (p.user.id || p.user._id)) ||
+        p.user?.id ||
+        p.id ||
+        p.user?.userId ||
+        null;
+      const candidateName =
+        (p.user && (p.user.username || p.user.displayName)) ||
+        p.username ||
+        p.user?.username ||
+        "";
+      if (
+        typeof candidateId === "string" &&
+        candidateId.toLowerCase().startsWith("bot:")
+      )
+        return true;
+      if (
+        typeof candidateName === "string" &&
+        candidateName.toLowerCase().includes("bot")
+      )
+        return true;
+      if (p.isBot || (p.user && p.user.isBot)) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
 async function attemptMatchmaking(context) {
   // context must provide: io, rooms, generateRoomCode, User, tryReserveActiveRoom, releaseActiveRoom
   if (!playQueue.size) return;
@@ -351,14 +388,13 @@ async function attemptMatchmaking(context) {
               (p) => p.color === "w" || p.color === "b"
             );
             const activeCount = colored.filter((p) => !!p.online).length;
-            // detect bot presence either through settings.bot or player id pattern
-            const isBot =
-              (room.settings && room.settings.bot) ||
-              (room.players || []).some((p) =>
-                String(p.id || "")
-                  .toLowerCase()
-                  .startsWith("bot:")
-              );
+
+            // detect bot presence robustly via players' user fields or explicit settings.bot
+            const isBot = detectIsBotRoomFromPlayers(
+              room.players,
+              room.settings
+            );
+
             if (!isBot && colored.length === 2 && activeCount === 2) {
               room.clocks = {
                 w: room.settings.minutesMs,
@@ -371,6 +407,9 @@ async function attemptMatchmaking(context) {
                   context.scheduleFirstMoveTimer(fallbackRoomId);
               } catch (e) {}
             } else {
+              // mark setting so other parts of code can easily detect this
+              if (isBot)
+                room.settings = { ...(room.settings || {}), bot: true };
               room.clocks = room.clocks || null;
             }
           } catch (e) {}
@@ -399,6 +438,63 @@ async function attemptMatchmaking(context) {
 
       if (createdRoomId) {
         try {
+          // Ensure that if the created room contains a bot we remove clocks/clear any timers
+          try {
+            // attempt to find the room object either in in-memory map or via roomManager
+            let roomObj =
+              context.rooms && context.rooms[createdRoomId]
+                ? context.rooms[createdRoomId]
+                : null;
+
+            // If roomManager can provide a room getter, try that (non-breaking)
+            if (
+              !roomObj &&
+              context.roomManager &&
+              typeof context.roomManager.getRoom === "function"
+            ) {
+              try {
+                roomObj = await context.roomManager.getRoom(createdRoomId);
+              } catch (e) {
+                // ignore
+              }
+            }
+
+            if (roomObj) {
+              const isBotRoom = detectIsBotRoomFromPlayers(
+                roomObj.players,
+                roomObj.settings
+              );
+              if (isBotRoom) {
+                roomObj.settings = { ...(roomObj.settings || {}), bot: true };
+                // ensure clocks cleared
+                roomObj.clocks = null;
+                // if context provides a way to clear scheduled timers for a room, call it
+                try {
+                  if (typeof context.cancelRoomTimers === "function") {
+                    context.cancelRoomTimers(createdRoomId);
+                  } else if (typeof context.clearRoomTimersFor === "function") {
+                    context.clearRoomTimersFor(createdRoomId);
+                  } else if (
+                    context.scheduleClear &&
+                    typeof context.scheduleClear === "function"
+                  ) {
+                    // don't rely on this; just attempt if exist
+                    try {
+                      context.scheduleClear(createdRoomId);
+                    } catch (e) {}
+                  }
+                } catch (e) {}
+                // broadcast updated room state so frontends receive clocks=null
+                try {
+                  context.broadcastRoomState(createdRoomId);
+                } catch (e) {}
+              }
+            }
+          } catch (e) {
+            // don't fail matchmaking if post-creation cleanup failed
+            console.error("post-create bot-room cleanup error", e);
+          }
+
           const s1 = context.io.sockets.sockets.get(e1.socketId);
           const s2 = context.io.sockets.sockets.get(e2.socketId);
           if (s1) s1.join(createdRoomId);
