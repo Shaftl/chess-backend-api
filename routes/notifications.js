@@ -250,6 +250,68 @@ router.post("/:id/read", restAuthMiddleware, async (req, res) => {
 });
 
 /**
+ * POST /api/notifications/mark-all-read
+ * Marks all notifications for the current user as read, emits updates to connected clients.
+ */
+router.post("/mark-all-read", restAuthMiddleware, async (req, res) => {
+  try {
+    const me = req.user;
+    if (!me || !me.id) return res.status(401).json({ error: "Missing auth" });
+
+    // Update all unread notifications for this user
+    const now = Date.now();
+    // updateMany result shape depends on mongoose version; check both fields
+    const updateResult = await Notification.updateMany(
+      { userId: String(me.id), read: false },
+      { $set: { read: true, updatedAt: now } }
+    ).exec();
+
+    const updatedCount =
+      typeof updateResult.modifiedCount !== "undefined"
+        ? updateResult.modifiedCount
+        : updateResult.nModified || 0;
+
+    // Fetch the most-recent notifications for the user (limit to 200 to match UI)
+    const rows = await Notification.find({ userId: String(me.id) })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean()
+      .exec();
+
+    // Emit updated notifications individually (best-effort)
+    try {
+      for (const d of rows) {
+        try {
+          // Only emit those that are now read (or all of them — harmless)
+          const payload = {
+            id: String(d._id),
+            _id: String(d._id),
+            userId: d.userId,
+            type: d.type,
+            title: d.title,
+            body: d.body,
+            data: d.data,
+            read: !!d.read,
+            status: d.status || null,
+            createdAt: d.createdAt,
+          };
+          emitToUser(String(d.userId), "notification", payload);
+        } catch (e) {
+          // ignore per-notification failures
+        }
+      }
+    } catch (e) {
+      // ignore emit loop failures
+    }
+
+    return res.json({ ok: true, updatedCount, notifications: rows || [] });
+  } catch (err) {
+    console.error("POST /api/notifications/mark-all-read error", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/**
  * POST /api/notifications/:id/action
  * body: { action: "accept_friend" | "decline_friend" | "accept_rematch" | "decline_rematch" | "accept_draw" | "decline_draw" | "accept_challenge" | "decline_challenge" }
  *
