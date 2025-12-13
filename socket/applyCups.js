@@ -357,12 +357,49 @@ module.exports = async function applyCups(context, gameIdOrDoc) {
       const winnerBefore = Number(winnerUser.cups ?? 0);
       const loserBefore = Number(loserUser.cups ?? 0);
 
+      // Increment winner normally
       await User.findByIdAndUpdate(winnerUser._id, {
         $inc: { cups: Number(delta) },
       }).exec();
-      await User.findByIdAndUpdate(loserUser._id, {
-        $inc: { cups: -Number(delta) },
-      }).exec();
+
+      // Decrement loser but ensure cups never go below 0.
+      // First attempt: aggregation-pipeline update (Mongo 4.2+; atomic).
+      // Fallback: do a $inc then immediately clamp negative values to 0.
+      let pipelineWorked = false;
+      try {
+        await User.updateOne({ _id: loserUser._id }, [
+          {
+            $set: {
+              cups: {
+                $max: [0, { $subtract: ["$cups", Number(delta)] }],
+              },
+            },
+          },
+        ]).exec();
+        pipelineWorked = true;
+      } catch (e) {
+        pipelineWorked = false;
+      }
+
+      if (!pipelineWorked) {
+        // Fallback: decrement, then ensure non-negative by clamping any negative cups to 0.
+        try {
+          await User.findByIdAndUpdate(loserUser._id, {
+            $inc: { cups: -Number(delta) },
+          }).exec();
+        } catch (e) {
+          // ignore
+        }
+        try {
+          // Atomic conditional clamp: only sets cups to 0 if it's currently < 0
+          await User.updateOne(
+            { _id: loserUser._id, cups: { $lt: 0 } },
+            { $set: { cups: 0 } }
+          ).exec();
+        } catch (e) {
+          // ignore
+        }
+      }
 
       // mark Game as processed
       try {
@@ -372,16 +409,40 @@ module.exports = async function applyCups(context, gameIdOrDoc) {
         ).exec();
       } catch (e) {}
 
+      // fetch actual new values for accurate notifications/logging
+      let winnerAfterVal = null,
+        loserAfterVal = null;
+      try {
+        const wDoc = await User.findById(winnerUser._id)
+          .select("cups")
+          .lean()
+          .exec();
+        winnerAfterVal = Number(
+          wDoc?.cups ?? Math.max(0, winnerBefore + delta)
+        );
+      } catch (e) {
+        winnerAfterVal = Math.max(0, winnerBefore + delta);
+      }
+      try {
+        const lDoc = await User.findById(loserUser._id)
+          .select("cups")
+          .lean()
+          .exec();
+        loserAfterVal = Number(lDoc?.cups ?? Math.max(0, loserBefore - delta));
+      } catch (e) {
+        loserAfterVal = Math.max(0, loserBefore - delta);
+      }
+
       // notify users (best-effort)
       try {
         notifyUser(String(winnerUser._id), "cups-changed", {
-          cups: Number(winnerBefore + delta),
+          cups: Number(winnerAfterVal),
           delta: Number(delta),
         });
       } catch (e) {}
       try {
         notifyUser(String(loserUser._id), "cups-changed", {
-          cups: Number(Math.max(0, loserBefore - delta)),
+          cups: Number(Math.max(0, loserAfterVal)),
           delta: -Number(delta),
         });
       } catch (e) {}
@@ -393,13 +454,13 @@ module.exports = async function applyCups(context, gameIdOrDoc) {
           id: winnerUser._id,
           username: winnerUser.username,
           before: winnerBefore,
-          after: Math.max(0, winnerBefore + delta),
+          after: Number(winnerAfterVal),
         },
         loser: {
           id: loserUser._id,
           username: loserUser.username,
           before: loserBefore,
-          after: Math.max(0, loserBefore - delta),
+          after: Number(Math.max(0, loserAfterVal)),
         },
       });
 

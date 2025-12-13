@@ -243,38 +243,72 @@ async function finishRoom(roomId, finishedObj) {
 }
 
 // fallback apply: atomic increment/decrement if applyCups is not available
+// safe fallback apply: atomic increment/decrement with clamp to prevent negative cups
 async function applyFallbackDelta(winnerId, loserId, delta = 12) {
   try {
     if (!winnerId || !loserId) {
       console.warn("applyFallbackDelta: missing ids", winnerId, loserId);
       return { ok: false, reason: "missing-ids" };
     }
-    // ensure numeric delta and integer
-    const d = Number(delta) || 12;
-    // use findByIdAndUpdate with $inc to avoid race conditions
-    const beforeWinner = await User.findById(winnerId)
+    const d = Math.max(1, Math.round(Number(delta) || 12));
+
+    // 1) Increment winner (simple $inc is fine)
+    try {
+      await User.updateOne(
+        { _id: winnerId },
+        { $inc: { cups: Math.abs(d) } }
+      ).exec();
+    } catch (e) {
+      console.warn("[applyFallbackDelta] winner $inc failed, continuing:", e);
+    }
+
+    // 2) Decrement loser but ensure cups never go below 0.
+    // Try aggregation-pipeline update first (Mongo 4.2+): cups = max(0, cups - d)
+    let pipelineWorked = false;
+    try {
+      await User.updateOne({ _id: loserId }, [
+        {
+          $set: {
+            cups: {
+              $max: [0, { $subtract: ["$cups", Number(d)] }],
+            },
+          },
+        },
+      ]).exec();
+      pipelineWorked = true;
+    } catch (e) {
+      pipelineWorked = false;
+    }
+
+    // Fallback if aggregation pipeline not supported: do $inc then clamp negatives to 0.
+    if (!pipelineWorked) {
+      try {
+        await User.updateOne(
+          { _id: loserId },
+          { $inc: { cups: -Math.abs(d) } }
+        ).exec();
+      } catch (e) {
+        console.warn("[applyFallbackDelta] loser $inc failed:", e);
+      }
+      try {
+        // atomic conditional clamp: set cups to 0 only if it's currently < 0
+        await User.updateOne(
+          { _id: loserId, cups: { $lt: 0 } },
+          { $set: { cups: 0 } }
+        ).exec();
+      } catch (e) {
+        console.warn("[applyFallbackDelta] loser clamp failed:", e);
+      }
+    }
+
+    // Read back accurate documents to return
+    const winnerUpdate = await User.findById(winnerId)
       .select("cups username")
       .lean()
       .exec();
-    const beforeLoser = await User.findById(loserId)
+    const loserUpdate = await User.findById(loserId)
       .select("cups username")
       .lean()
-      .exec();
-
-    const winnerUpdate = await User.findByIdAndUpdate(
-      winnerId,
-      { $inc: { cups: Math.abs(d) } },
-      { new: true, lean: true }
-    )
-      .select("cups username")
-      .exec();
-
-    const loserUpdate = await User.findByIdAndUpdate(
-      loserId,
-      { $inc: { cups: -Math.abs(d) } },
-      { new: true, lean: true }
-    )
-      .select("cups username")
       .exec();
 
     console.log("[applyFallbackDelta] applied fallback cups delta:", {
@@ -282,16 +316,15 @@ async function applyFallbackDelta(winnerId, loserId, delta = 12) {
       winner: {
         id: winnerId,
         username: winnerUpdate?.username,
-        before: beforeWinner?.cups,
         after: winnerUpdate?.cups,
       },
       loser: {
         id: loserId,
         username: loserUpdate?.username,
-        before: beforeLoser?.cups,
         after: loserUpdate?.cups,
       },
     });
+
     return { ok: true, delta: d, winner: winnerUpdate, loser: loserUpdate };
   } catch (e) {
     console.error("[applyFallbackDelta] error:", e);
